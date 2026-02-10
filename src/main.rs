@@ -118,10 +118,10 @@ impl Action {
                 state.set(JoypadBtn::Left.into(), true);
             }
             Action::Punch => {
-                state.set(JoypadBtn::TurboB.into(), true);
+                state.set(JoypadBtn::B.into(), true);
             } // B = punch
             Action::Kick => {
-                state.set(JoypadBtn::TurboA.into(), true);
+                state.set(JoypadBtn::A.into(), true);
             } // A = kick
             Action::Crouch => {
                 state.set(JoypadBtn::Down.into(), true);
@@ -131,35 +131,35 @@ impl Action {
             }
             Action::RightPunch => {
                 state.set(JoypadBtn::Right.into(), true);
-                state.set(JoypadBtn::TurboB.into(), true);
+                state.set(JoypadBtn::B.into(), true);
             }
             Action::RightKick => {
                 state.set(JoypadBtn::Right.into(), true);
-                state.set(JoypadBtn::TurboA.into(), true);
+                state.set(JoypadBtn::A.into(), true);
             }
             Action::LeftPunch => {
                 state.set(JoypadBtn::Left.into(), true);
-                state.set(JoypadBtn::TurboB.into(), true);
+                state.set(JoypadBtn::B.into(), true);
             }
             Action::LeftKick => {
                 state.set(JoypadBtn::Left.into(), true);
-                state.set(JoypadBtn::TurboA.into(), true);
+                state.set(JoypadBtn::A.into(), true);
             }
             Action::CrouchPunch => {
                 state.set(JoypadBtn::Down.into(), true);
-                state.set(JoypadBtn::TurboB.into(), true);
+                state.set(JoypadBtn::B.into(), true);
             }
             Action::CrouchKick => {
                 state.set(JoypadBtn::Down.into(), true);
-                state.set(JoypadBtn::TurboA.into(), true);
+                state.set(JoypadBtn::A.into(), true);
             }
             Action::JumpPunch => {
                 state.set(JoypadBtn::Up.into(), true);
-                state.set(JoypadBtn::TurboB.into(), true);
+                state.set(JoypadBtn::B.into(), true);
             }
             Action::JumpKick => {
                 state.set(JoypadBtn::Up.into(), true);
-                state.set(JoypadBtn::TurboA.into(), true);
+                state.set(JoypadBtn::A.into(), true);
             }
         }
         state
@@ -723,12 +723,15 @@ impl NesEnv {
             let reward = self.compute_reward(&state);
             frame_reward += reward;
 
-            // Check done: lives depleted
-            if state.player_lives == 0 && self.prev_state.player_lives > 0 {
-                done = true;
+            // Check done: lives depleted (penalize any life loss)
+            if state.player_lives < self.prev_state.player_lives && self.prev_state.player_lives > 0
+            {
                 frame_reward -= 25.0; // Death penalty
-                self.session_state = SessionState::WaitForTitle;
-                self.countdown_seen = false;
+                if state.player_lives == 0 {
+                    done = true;
+                    self.session_state = SessionState::WaitForTitle;
+                    self.countdown_seen = false;
+                }
             }
 
             self.prev_state = state;
@@ -919,14 +922,14 @@ impl ReplayBuffer {
     fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let file = File::create(path.as_ref())?;
         let writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(writer, self)?;
+        bincode::serialize_into(writer, self)?;
         Ok(())
     }
 
     fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let reader = std::io::BufReader::new(file);
-        let replay = serde_json::from_reader(reader)?;
+        let replay = bincode::deserialize_from(reader)?;
         Ok(replay)
     }
 
@@ -994,7 +997,7 @@ fn save_checkpoint(
         .target_varmap
         .save(Path::new(dir).join("target.safetensors"))?;
     agent.save_optimizer(Path::new(dir).join("optimizer.safetensors"))?;
-    agent.replay.save(Path::new(dir).join("replay.json"))?;
+    agent.replay.save(Path::new(dir).join("replay.bin"))?;
 
     let meta = TrainMeta {
         best_reward,
@@ -1206,7 +1209,7 @@ impl DqnAgent {
         let model_path = resume_dir.join("model.safetensors");
         let target_path = resume_dir.join("target.safetensors");
         let optimizer_path = resume_dir.join("optimizer.safetensors");
-        let replay_path = resume_dir.join("replay.json");
+        let replay_bin_path = resume_dir.join("replay.bin");
         let meta_path = resume_dir.join("meta.json");
 
         self.online_varmap.load(&model_path)?;
@@ -1216,7 +1219,7 @@ impl DqnAgent {
                 "⚠️  Optimizer state load failed ({err}). Continuing with fresh optimizer state."
             );
         }
-        let replay = ReplayBuffer::load(&replay_path)?;
+        let replay = ReplayBuffer::load(&replay_bin_path)?;
 
         let file = File::open(&meta_path)?;
         let reader = std::io::BufReader::new(file);
