@@ -644,8 +644,6 @@ impl NesEnv {
         let mut frame_reward = 0.0;
         let mut done = false;
         let mut playing = true;
-        let mut state = self.read_state();
-
         if self.session_state != SessionState::Playing {
             let state = self.run_state_machine(180)?;
             self.log_state("step-nonplay", &state);
@@ -669,7 +667,7 @@ impl NesEnv {
             self.set_input(effective_action);
             self.clock_frame()?;
 
-            state = self.read_state();
+            let state = self.read_state();
 
             // --- Reward computation ---
             let reward = self.compute_reward(&state);
@@ -1163,7 +1161,11 @@ impl DqnAgent {
 
         self.online_varmap.load(&model_path)?;
         self.target_varmap.load(&target_path)?;
-        self.load_optimizer(&optimizer_path)?;
+        if let Err(err) = self.load_optimizer(&optimizer_path) {
+            eprintln!(
+                "⚠️  Optimizer state load failed ({err}). Continuing with fresh optimizer state."
+            );
+        }
         let replay = ReplayBuffer::load(&replay_path)?;
 
         let file = File::open(&meta_path)?;
