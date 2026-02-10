@@ -1,0 +1,55 @@
+# RAM Map - Kung Fu (NES)
+
+This document tracks the memory addresses used for state extraction in the `kungfu_rl_rs` project.
+
+## Confirmed Addresses
+
+| Address | Name | Size | Description | Potential Values / Meanings |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x005C` | `PLAYER_LIVES` | 1 | Remaining lives. | Typically 0-5 (3 at start). |
+| `0x00D4` | `PLAYER_X` | 1 | Player horizontal position. | 0-255 (screen-space). |
+| `0x00B6` | `PLAYER_Y` | 1 | Player vertical position. | 0-255 (screen-space). |
+| `0x04A6` | `PLAYER_HP` | 1 | Player health points (see Technical Notes). | 0-176 expected, `0xFF` sentinel during death. |
+| `0x036E` | `PLAYER_POSE` | 1 | Player pose/animation index. | Changes with actions and movement. |
+| `0x036F` | `PLAYER_STATE` | 1 | Player direction and attack state (see Notes). | Low nibble: direction/stance; high nibble: attack type. |
+| `0x00CE - 0x00D1` | `ENEMY_X` | 4 | X positions for enemy slots 0 through 3. | 0-255 (screen-space). |
+| `0x0087 - 0x008A` | `ENEMY_TYPE` | 4 | Enemy type identifiers for slots 0 through 3. | 0-7 observed (enemy class id). |
+| `0x00B0 - 0x00B3` | `ENEMY_Y` | 4 | Y positions for enemy slots 0 through 3. | 0-255 (screen-space). |
+| `0x00C0 - 0x00C3` | `ENEMY_FACING` | 4 | Facing direction for enemy slots 0 through 3. | 0/1 (L/R). |
+| `0x00DF - 0x00E2` | `ENEMY_POSE` | 4 | Animation/pose state for enemy slots 0 through 3. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x03B1` | `KILL_COUNTER` | 1 | Total number of enemies defeated in current run. | Monotonic counter, wraps at 255. |
+| `0x0531 - 0x0536` | `SCORE_DIGITS` | 6 | BCD-encoded score digits. | Each byte is a single digit 0-9 (low nibble). |
+| `0x0501 - 0x0506` | `TOP_SCORE_DIGITS` | 6 | BCD-encoded score digits. | Each byte is a single digit 0-9 (low nibble). |
+| `0x0390 - 0x0393` | `TIMER_DIGITS` | 4 | BCD-encoded timer digits. | Four-digit timer (e.g., 1079). |
+
+## Unconfirmed / To Verify
+
+| Address | Name | Status | Notes | Potential Values / Meanings |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x0534` | `BOSS_HP` | Conflict | Confirmed as `score_100` digit. Boss HP is likely elsewhere. | If found elsewhere, likely 0-255 decreasing during boss fight. |
+| `0x0058` | `FLOOR` | To Verify | Supposedly tracks the current stage/floor level. | Small integer that increments on floor transition (0-5 or 1-6). |
+| `0x0050` | `PLAYER_STATE` | To Verify | Legacy placeholder, superseded by `0x036F`. | Remove from code once unused. |
+
+## Technical Notes
+
+### Player HP Behavior
+The `PLAYER_HP` address (`0x04A6`) occasionally reads `0xFF` during the death sequence or transition.
+- Treatment: When reading this value for reinforcement learning observations, treat it as `0` (dead) or clamp to the expected maximum range to avoid reward spikes.
+
+### Score Mapping
+The address `0x0534` specifically maps to one of the decimal places in the HUD score. Any previous documentation suggesting this is `BOSS_HP` should be disregarded.
+
+### Player State Encoding (`0x036F`)
+Low nibble:
+- 0: left standing
+- 1: right standing
+- 2: left facing down
+- 3: right facing down
+- 4: left facing jump
+- 5: right facing jump
+
+High nibble:
+- 0: neutral
+- 1: kicking
+- 2: punching
+- (possible 1/2 combo for attacking)

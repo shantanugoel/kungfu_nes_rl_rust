@@ -266,8 +266,18 @@ pub struct NesEnv {
 }
 
 impl NesEnv {
-    pub fn new(rom_path: PathBuf, frame_skip: u32, sticky_prob: f64) -> Result<Self> {
+    pub fn new(
+        rom_path: PathBuf,
+        frame_skip: u32,
+        sticky_prob: f64,
+        headless: bool,
+    ) -> Result<Self> {
         let mut deck = ControlDeck::new();
+        let mut headless_mode = tetanes_core::control_deck::HeadlessMode::NO_AUDIO;
+        if headless {
+            headless_mode |= tetanes_core::control_deck::HeadlessMode::NO_VIDEO;
+        }
+        deck.set_headless_mode(headless_mode);
         deck.load_rom_path(&rom_path)
             .with_context(|| format!("Failed to load ROM: {}", rom_path.display()))?;
 
@@ -1332,13 +1342,18 @@ fn train(args: &TrainArgs) -> Result<()> {
     eprintln!("═══════════════════════════════════════════════════════════");
 
     // Select device: Metal on Apple Silicon, else CPU
-    let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+    let device = if args.cpu {
+        Device::Cpu
+    } else {
+        Device::new_metal(0).unwrap_or(Device::Cpu)
+    };
     eprintln!("Device: {:?}", device);
 
     let mut env = NesEnv::new(
         args.rom.clone(),
         args.frame_skip,
         0.25, // sticky action probability
+        !args.render,
     )?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
@@ -1578,9 +1593,13 @@ fn play(args: &PlayArgs) -> Result<()> {
     eprintln!("  PLAYING — Kung Fu Master DQN Agent");
     eprintln!("═══════════════════════════════════════════════════════════");
 
-    let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+    let device = if args.cpu {
+        Device::Cpu
+    } else {
+        Device::new_metal(0).unwrap_or(Device::Cpu)
+    };
 
-    let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
+    let mut env = NesEnv::new(args.rom.clone(), 4, 0.0, false)?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
     let mut agent = DqnAgent::new(&device)?;
@@ -1667,7 +1686,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
     eprintln!("or modify this to inject Start presses automatically.");
     eprintln!("═══════════════════════════════════════════════════════════");
 
-    let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
+    let mut env = NesEnv::new(args.rom.clone(), 1, 0.0, false)?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
 
@@ -1805,7 +1824,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
 fn baseline(args: &BaselineArgs) -> Result<()> {
     eprintln!("Running random agent baseline...");
 
-    let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
+    let mut env = NesEnv::new(args.rom.clone(), 4, 0.0, true)?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
     let mut rng = rand::rng();
@@ -1858,7 +1877,7 @@ fn manual(args: &ManualArgs) -> Result<()> {
     eprintln!("Arrows: Move | Z: B (Punch) | X: A (Kick) | A: Select | S: Start");
     eprintln!("Space: Pause | Esc: Quit");
 
-    let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
+    let mut env = NesEnv::new(args.rom.clone(), 1, 0.0, false)?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
     let _ = env.reset()?;
@@ -1981,6 +2000,8 @@ struct TrainArgs {
     #[arg(long, default_value_t = false)]
     render: bool,
     #[arg(long, default_value_t = false)]
+    cpu: bool,
+    #[arg(long, default_value_t = false)]
     no_clock: bool,
     #[arg(long, default_value_t = false)]
     real_time: bool,
@@ -1996,6 +2017,8 @@ struct PlayArgs {
     model: PathBuf,
     #[arg(long, default_value = "5")]
     episodes: usize,
+    #[arg(long, default_value_t = false)]
+    cpu: bool,
     #[arg(long, default_value_t = false)]
     no_clock: bool,
     #[arg(long, default_value_t = false)]
