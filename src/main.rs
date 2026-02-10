@@ -195,9 +195,9 @@ pub struct GameState {
 
 impl GameState {
     /// Convert to normalized f32 feature vector for the neural network
-    /// Returns ~30 features, all in [0.0, 1.0]
+    /// Returns a normalized feature vector (mostly in [-1.0, 1.0])
     pub fn to_features(&self) -> Vec<f32> {
-        let mut f = Vec::with_capacity(34);
+        let mut f = Vec::with_capacity(33);
 
         f.push(self.player_x as f32 / 255.0);
         f.push(self.player_y as f32 / 255.0);
@@ -211,19 +211,59 @@ impl GameState {
         f.push(self.player_state as f32 / 255.0);
         f.push(self.floor as f32 / 5.0);
 
-        // 4 enemy slots × 5 features = 20
-        for i in 0..4 {
-            f.push(self.enemy_x[i] as f32 / 255.0);
-            f.push(self.enemy_y[i] as f32 / 255.0);
-            f.push(self.enemy_type[i] as f32 / 7.0); // Types 0-7
-            f.push(self.enemy_facing[i] as f32); // 0 or 1
-            f.push(if self.enemy_active[i] { 1.0 } else { 0.0 });
+        #[derive(Clone, Copy)]
+        struct EnemyFeatures {
+            sort_key: f32,
+            active: f32,
+            dx: f32,
+            dy: f32,
+            abs_dx: f32,
+            enemy_type: f32,
+            facing: f32,
         }
 
-        // Relative enemy positions (distance to player)
+        let mut enemies = Vec::with_capacity(4);
         for i in 0..4 {
-            let dx = (self.enemy_x[i] as f32 - self.player_x as f32) / 255.0;
-            f.push(dx);
+            if self.enemy_active[i] {
+                let dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
+                let dy_raw = self.enemy_y[i] as f32 - self.player_y as f32;
+                let abs_dx = dx_raw.abs() / 255.0;
+                enemies.push(EnemyFeatures {
+                    sort_key: abs_dx,
+                    active: 1.0,
+                    dx: dx_raw / 255.0,
+                    dy: dy_raw / 255.0,
+                    abs_dx,
+                    enemy_type: self.enemy_type[i] as f32 / 7.0,
+                    facing: self.enemy_facing[i] as f32,
+                });
+            } else {
+                enemies.push(EnemyFeatures {
+                    sort_key: f32::INFINITY,
+                    active: 0.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    abs_dx: 0.0,
+                    enemy_type: 0.0,
+                    facing: 0.0,
+                });
+            }
+        }
+
+        enemies.sort_by(|a, b| {
+            a.sort_key
+                .partial_cmp(&b.sort_key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 4 enemy slots × 6 features = 24 (sorted by nearest |dx|, inactive zeroed)
+        for enemy in enemies {
+            f.push(enemy.active);
+            f.push(enemy.dx);
+            f.push(enemy.dy);
+            f.push(enemy.abs_dx);
+            f.push(enemy.enemy_type);
+            f.push(enemy.facing);
         }
 
         f.push(self.boss_hp as f32 / 255.0);
@@ -234,7 +274,7 @@ impl GameState {
     }
 }
 
-pub const STATE_DIM: usize = 34; // Must match to_features() length
+pub const STATE_DIM: usize = 33; // Must match to_features() length
 const GAME_MODE_TITLE: u8 = 0x00;
 const GAME_MODE_COUNTDOWN: u8 = 0x01;
 const GAME_MODE_ACTION: u8 = 0x02;
