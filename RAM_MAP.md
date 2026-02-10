@@ -17,6 +17,7 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x00B0 - 0x00B3` | `ENEMY_Y` | 4 | Y positions for enemy slots 0 through 3. | 0-255 (screen-space). |
 | `0x00C0 - 0x00C3` | `ENEMY_FACING` | 4 | Facing direction for enemy slots 0 through 3. | 0/1 (L/R). |
 | `0x00DF - 0x00E2` | `ENEMY_POSE` | 4 | Animation/pose state for enemy slots 0 through 3. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x04A0 - 0x04A3` | `ENEMY_ENERGY` | 4 | Enemy energy per slot 0 through 3. | See Enemy Energy Behavior. |
 | `0x03D4 - 0x03D7` | `KNIFE_X` | 4 | Knife projectile X positions for slots 0 through 3. | 0-255; 0 or `0xF9` when off-screen. |
 | `0x03D0 - 0x03D3` | `KNIFE_Y` | 4 | Knife projectile Y positions for slots 0 through 3. | 0-255 (screen-space). |
 | `0x03EC - 0x03EF` | `KNIFE_STATE` | 4 | Knife active + facing for slots 0 through 3. | `0x00` inactive, `0x11` facing right, `0x01` facing left. |
@@ -60,3 +61,7 @@ High nibble:
 
 ### Knife/Projectile Behavior
 Use `KNIFE_STATE` to determine active projectiles; treat `KNIFE_X` and `KNIFE_Y` as valid only when the corresponding state is nonzero.
+
+### Enemy Energy Behavior
+- 1-hit enemies: `ENEMY_ENERGY` reads `0x00` while active; on death it becomes `0xFF` momentarily.
+- 2-hit enemies: `ENEMY_ENERGY` starts at `0x01`; after the first hit it becomes `0x00`; on the killing hit it becomes `0xFF` momentarily.

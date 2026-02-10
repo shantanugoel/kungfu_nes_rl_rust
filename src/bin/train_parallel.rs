@@ -34,6 +34,7 @@ mod ram {
     pub const ENEMY_Y: [u16; 4] = [0x00B0, 0x00B1, 0x00B2, 0x00B3];
     pub const ENEMY_FACING: [u16; 4] = [0x00C0, 0x00C1, 0x00C2, 0x00C3];
     pub const ENEMY_POSE: [u16; 4] = [0x00DF, 0x00E0, 0x00E1, 0x00E2];
+    pub const ENEMY_ENERGY: [u16; 4] = [0x04A0, 0x04A1, 0x04A2, 0x04A3];
     pub const KNIFE_X: [u16; 4] = [0x03D4, 0x03D5, 0x03D6, 0x03D7];
     pub const KNIFE_Y: [u16; 4] = [0x03D0, 0x03D1, 0x03D2, 0x03D3];
     pub const KNIFE_STATE: [u16; 4] = [0x03EC, 0x03ED, 0x03EE, 0x03EF];
@@ -159,6 +160,7 @@ pub struct GameState {
     pub enemy_type: [u8; 4],
     pub enemy_facing: [u8; 4],
     pub enemy_active: [bool; 4],
+    pub enemy_energy: [u8; 4],
     pub knife_x: [u8; 4],
     pub knife_y: [u8; 4],
     pub knife_facing: [u8; 4],
@@ -397,6 +399,7 @@ impl NesEnv {
             state.enemy_facing[i] = self.peek(ram::ENEMY_FACING[i]);
             let pose = self.peek(ram::ENEMY_POSE[i]);
             state.enemy_active[i] = pose != 0 && pose != 0x7F;
+            state.enemy_energy[i] = self.peek(ram::ENEMY_ENERGY[i]);
 
             state.knife_x[i] = self.peek(ram::KNIFE_X[i]);
             state.knife_y[i] = self.peek(ram::KNIFE_Y[i]);
@@ -606,6 +609,16 @@ impl NesEnv {
         let kill_delta = cur.kill_count.wrapping_sub(prev.kill_count);
         if kill_delta > 0 && kill_delta < 10 {
             reward += kill_delta as f64 * 5.0;
+        }
+
+        for i in 0..4 {
+            if prev.enemy_active[i] && cur.enemy_active[i] {
+                let prev_energy = prev.enemy_energy[i];
+                let cur_energy = cur.enemy_energy[i];
+                if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF {
+                    reward += (prev_energy - cur_energy) as f64 * 2.0;
+                }
+            }
         }
 
         let score_delta = cur.score as i64 - prev.score as i64;
