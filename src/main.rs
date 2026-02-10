@@ -16,6 +16,8 @@ use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -23,6 +25,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
+fn blit_rgba_to_u32(fb: &[u8], out: &mut [u32]) {
+    for (dst, src) in out.iter_mut().zip(fb.chunks_exact(4)) {
+        *dst = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | (src[2] as u32);
+    }
+}
+
 fn update_pause_from_window(env: &mut NesEnv, window: &minifb::Window) {
     if window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::No) {
         env.toggle_pause();
@@ -196,20 +204,21 @@ pub struct GameState {
 impl GameState {
     /// Convert to normalized f32 feature vector for the neural network
     /// Returns a normalized feature vector (mostly in [-1.0, 1.0])
-    pub fn to_features(&self) -> Vec<f32> {
-        let mut f = Vec::with_capacity(33);
+    pub fn to_features(&self) -> [f32; STATE_DIM] {
+        let mut f = [0f32; STATE_DIM];
+        let mut idx = 0;
 
-        f.push(self.player_x as f32 / 255.0);
-        f.push(self.player_y as f32 / 255.0);
+        f[idx] = self.player_x as f32 / 255.0; idx += 1;
+        f[idx] = self.player_y as f32 / 255.0; idx += 1;
         let hp = if self.player_hp == 0xFF {
             0.0
         } else {
             self.player_hp as f32
         };
-        f.push(hp / 176.0); // Max HP is ~176
-        f.push(self.player_lives as f32 / 5.0);
-        f.push(self.player_state as f32 / 255.0);
-        f.push(self.floor as f32 / 5.0);
+        f[idx] = hp / 176.0; idx += 1;
+        f[idx] = self.player_lives as f32 / 5.0; idx += 1;
+        f[idx] = self.player_state as f32 / 255.0; idx += 1;
+        f[idx] = self.floor as f32 / 5.0; idx += 1;
 
         #[derive(Clone, Copy)]
         struct EnemyFeatures {
@@ -222,13 +231,21 @@ impl GameState {
             facing: f32,
         }
 
-        let mut enemies = Vec::with_capacity(4);
+        let mut enemies: [EnemyFeatures; 4] = [EnemyFeatures {
+            sort_key: f32::INFINITY,
+            active: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            abs_dx: 0.0,
+            enemy_type: 0.0,
+            facing: 0.0,
+        }; 4];
         for i in 0..4 {
             if self.enemy_active[i] {
                 let dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
                 let dy_raw = self.enemy_y[i] as f32 - self.player_y as f32;
                 let abs_dx = dx_raw.abs() / 255.0;
-                enemies.push(EnemyFeatures {
+                enemies[i] = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
                     dx: dx_raw / 255.0,
@@ -236,39 +253,28 @@ impl GameState {
                     abs_dx,
                     enemy_type: self.enemy_type[i] as f32 / 7.0,
                     facing: self.enemy_facing[i] as f32,
-                });
-            } else {
-                enemies.push(EnemyFeatures {
-                    sort_key: f32::INFINITY,
-                    active: 0.0,
-                    dx: 0.0,
-                    dy: 0.0,
-                    abs_dx: 0.0,
-                    enemy_type: 0.0,
-                    facing: 0.0,
-                });
+                };
             }
         }
 
-        enemies.sort_by(|a, b| {
+        enemies.sort_unstable_by(|a, b| {
             a.sort_key
                 .partial_cmp(&b.sort_key)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 4 enemy slots × 6 features = 24 (sorted by nearest |dx|, inactive zeroed)
-        for enemy in enemies {
-            f.push(enemy.active);
-            f.push(enemy.dx);
-            f.push(enemy.dy);
-            f.push(enemy.abs_dx);
-            f.push(enemy.enemy_type);
-            f.push(enemy.facing);
+        for enemy in &enemies {
+            f[idx] = enemy.active; idx += 1;
+            f[idx] = enemy.dx; idx += 1;
+            f[idx] = enemy.dy; idx += 1;
+            f[idx] = enemy.abs_dx; idx += 1;
+            f[idx] = enemy.enemy_type; idx += 1;
+            f[idx] = enemy.facing; idx += 1;
         }
 
-        f.push(self.boss_hp as f32 / 255.0);
-        f.push(self.timer as f32 / 255.0);
-        f.push(self.kill_count as f32 / 255.0);
+        f[idx] = self.boss_hp as f32 / 255.0; idx += 1;
+        f[idx] = self.timer as f32 / 255.0; idx += 1;
+        f[idx] = self.kill_count as f32 / 255.0;
 
         f
     }
@@ -303,6 +309,7 @@ pub struct NesEnv {
     session_state: SessionState,
     countdown_seen: bool,
     debug_state: bool,
+    rng: SmallRng,
 }
 
 impl NesEnv {
@@ -338,6 +345,7 @@ impl NesEnv {
             session_state: SessionState::Startup,
             countdown_seen: false,
             debug_state,
+            rng: SmallRng::from_os_rng(),
         })
     }
 
@@ -614,14 +622,13 @@ impl NesEnv {
     }
 
     /// Reset the emulator
-    pub fn reset(&mut self) -> Result<Vec<f32>> {
+    pub fn reset(&mut self) -> Result<[f32; STATE_DIM]> {
         self.deck.reset(ResetKind::Soft);
         self.session_state = SessionState::Startup;
         self.countdown_seen = false;
 
         // Random no-op start for stochasticity
-        let mut rng = rand::rng();
-        let noops = rng.random_range(1..30);
+        let noops = self.rng.random_range(1..30);
         for _ in 0..noops {
             self.clock_frame()?;
         }
@@ -679,11 +686,10 @@ impl NesEnv {
 
     /// Step the environment: apply action, advance frames, compute reward
     pub fn step(&mut self, action: Action) -> Result<StepResult> {
-        let mut rng = rand::rng();
         self.steps += 1;
 
         // Sticky action: with some probability, repeat previous action
-        let effective_action = if rng.random::<f64>() < self.sticky_prob {
+        let effective_action = if self.rng.random::<f64>() < self.sticky_prob {
             self.last_action
         } else {
             action
@@ -814,7 +820,7 @@ impl NesEnv {
 }
 
 pub struct StepResult {
-    pub state: Vec<f32>,
+    pub state: [f32; STATE_DIM],
     pub reward: f32,
     pub done: bool,
     pub score: u32,
@@ -887,10 +893,12 @@ impl DqnNet {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Transition {
-    state: Vec<f32>,
+    #[serde(with = "serde_big_array::BigArray")]
+    state: [f32; STATE_DIM],
     action: usize,
     reward: f32,
-    next_state: Vec<f32>,
+    #[serde(with = "serde_big_array::BigArray")]
+    next_state: [f32; STATE_DIM],
     done: bool,
 }
 
@@ -934,8 +942,7 @@ impl ReplayBuffer {
     }
 
     /// Sample a random batch, return tensors ready for training
-    fn sample(&self, batch_size: usize, dev: &Device) -> Result<BatchTensors> {
-        let mut rng = rand::rng();
+    fn sample(&self, batch_size: usize, dev: &Device, rng: &mut SmallRng) -> Result<BatchTensors> {
         let len = self.buffer.len();
         assert!(len >= batch_size);
 
@@ -1039,9 +1046,11 @@ struct DqnAgent {
     tau: f64, // Soft update coefficient
     replay: ReplayBuffer,
     batch_size: usize,
-    learn_start: usize, // Min replay size before training starts
-    train_freq: u64,    // Train every N steps
+    learn_start: usize,        // Min replay size before training starts
+    train_freq: u64,           // Train every N steps
+    target_update_freq: u64,   // Hard-update target every N gradient steps
     steps: u64,
+    rng: SmallRng,
 }
 
 struct AdamW {
@@ -1199,7 +1208,9 @@ impl DqnAgent {
             batch_size: 64,
             learn_start: 1000,
             train_freq: 4,
+            target_update_freq: 1000,
             steps: 0,
+            rng: SmallRng::from_os_rng(),
         };
         agent.hard_update_target()?;
         Ok(agent)
@@ -1228,14 +1239,13 @@ impl DqnAgent {
     }
 
     /// Select action using epsilon-greedy
-    fn select_action(&self, state: &[f32]) -> Result<usize> {
-        let mut rng = rand::rng();
-        if rng.random::<f64>() < self.epsilon {
-            Ok(rng.random_range(0..Action::COUNT))
+    fn select_action(&mut self, state: &[f32]) -> Result<usize> {
+        if self.rng.random::<f64>() < self.epsilon {
+            Ok(self.rng.random_range(0..Action::COUNT))
         } else {
             let s = Tensor::from_slice(state, (1, STATE_DIM), &self.device)?;
             let q = self.online_net.forward(&s)?;
-            let action = q.argmax(candle_core::D::Minus1)?.to_vec1::<u32>()?[0] as usize;
+            let action = q.argmax(candle_core::D::Minus1)?.squeeze(0)?.to_scalar::<u32>()? as usize;
             Ok(action)
         }
     }
@@ -1255,7 +1265,7 @@ impl DqnAgent {
             return Ok(0.0);
         }
 
-        let batch = self.replay.sample(self.batch_size, &self.device)?;
+        let batch = self.replay.sample(self.batch_size, &self.device, &mut self.rng)?;
 
         // Online net: Q(s, a) for the actions we actually took
         let q_all = self.online_net.forward(&batch.states)?;
@@ -1272,12 +1282,10 @@ impl DqnAgent {
             .squeeze(1)?;
 
         // Target: r + gamma * Q_target(s', argmax_a Q_online(s', a)) * (1 - done)
-        let gamma_t = Tensor::from_slice(&[self.gamma as f32], 1, &self.device)?
-            .broadcast_as(next_q.shape())?;
-
+        let discounted = next_q.affine(self.gamma, 0.0)?;
         let target = batch
             .rewards
-            .add(&gamma_t.mul(&next_q)?.mul(&batch.not_dones)?)?;
+            .add(&discounted.mul(&batch.not_dones)?)?;
 
         // Huber loss (smooth L1) — more robust than MSE for RL
         let diff = q_values.sub(&target.detach())?;
@@ -1295,8 +1303,10 @@ impl DqnAgent {
         // Backprop
         self.optimizer.backward_step(&loss)?;
 
-        // Soft update target network
-        self.soft_update_target()?;
+        // Periodic hard update target network (much cheaper than per-step soft update)
+        if self.steps % self.target_update_freq == 0 {
+            self.hard_update_target()?;
+        }
 
         // Decay epsilon
         self.epsilon = (self.epsilon * self.epsilon_decay).max(self.epsilon_min);
@@ -1415,10 +1425,6 @@ fn train(args: &TrainArgs) -> Result<()> {
     } else {
         None
     };
-    if let Some(win) = window.as_mut() {
-        win.set_target_fps(60);
-    }
-
     let mut agent = DqnAgent::new(&device)?;
 
     std::fs::create_dir_all("checkpoints")?;
@@ -1464,6 +1470,9 @@ fn train(args: &TrainArgs) -> Result<()> {
         }
     }
 
+    let mut buf = vec![0u32; 256 * 240];
+    let mut last_title_update = Instant::now();
+
     while total_steps < args.timesteps {
         episode += 1;
         let mut state = env.reset()?;
@@ -1488,10 +1497,10 @@ fn train(args: &TrainArgs) -> Result<()> {
             let result = env.step(Action::from_index(action_idx))?;
             if result.playing {
                 agent.remember(Transition {
-                    state: state.clone(),
+                    state,
                     action: action_idx,
                     reward: result.reward,
-                    next_state: result.state.clone(),
+                    next_state: result.state,
                     done: result.done,
                 });
 
@@ -1509,68 +1518,64 @@ fn train(args: &TrainArgs) -> Result<()> {
             state = result.state;
 
             if let Some(win) = window.as_mut() {
-                let overlay_ep = if last_render_ep == 0 {
-                    episode
-                } else {
-                    last_render_ep
-                };
-                let overlay_steps = if last_render_steps == 0 {
-                    total_steps
-                } else {
-                    last_render_steps
-                };
-                let overlay_reward = if last_render_ep == 0 {
-                    ep_reward
-                } else {
-                    last_render_reward
-                };
-                let overlay_avg = if last_render_ep == 0 {
-                    0.0
-                } else {
-                    last_render_avg
-                };
-                let overlay_score = if last_render_ep == 0 {
-                    env.prev_state.score
-                } else {
-                    last_render_score
-                };
-                let overlay_top = if last_render_ep == 0 {
-                    env.prev_state.top_score
-                } else {
-                    last_render_top
-                };
-                let overlay_kills = if last_render_ep == 0 {
-                    env.prev_state.kill_count
-                } else {
-                    last_render_kills
-                };
-                win.set_title(&format!(
-                    "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Top {overlay_top} | Kills {overlay_kills}"
-                ));
-                let fb = env.frame_buffer();
-                let mut buf = vec![0u32; 256 * 240];
-                for (i, pixel) in buf.iter_mut().enumerate() {
-                    let base = i * 4;
-                    if base + 2 < fb.len() {
-                        let r = fb[base] as u32;
-                        let g = fb[base + 1] as u32;
-                        let b = fb[base + 2] as u32;
-                        *pixel = (r << 16) | (g << 8) | b;
+                if total_steps % 4 == 0 {
+                    if last_title_update.elapsed().as_millis() > 250 {
+                        let overlay_ep = if last_render_ep == 0 {
+                            episode
+                        } else {
+                            last_render_ep
+                        };
+                        let overlay_steps = if last_render_steps == 0 {
+                            total_steps
+                        } else {
+                            last_render_steps
+                        };
+                        let overlay_reward = if last_render_ep == 0 {
+                            ep_reward
+                        } else {
+                            last_render_reward
+                        };
+                        let overlay_avg = if last_render_ep == 0 {
+                            0.0
+                        } else {
+                            last_render_avg
+                        };
+                        let overlay_score = if last_render_ep == 0 {
+                            env.prev_state.score
+                        } else {
+                            last_render_score
+                        };
+                        let overlay_top = if last_render_ep == 0 {
+                            env.prev_state.top_score
+                        } else {
+                            last_render_top
+                        };
+                        let overlay_kills = if last_render_ep == 0 {
+                            env.prev_state.kill_count
+                        } else {
+                            last_render_kills
+                        };
+                        win.set_title(&format!(
+                            "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Top {overlay_top} | Kills {overlay_kills}"
+                        ));
+                        last_title_update = Instant::now();
                     }
+                    let fb = env.frame_buffer();
+                    blit_rgba_to_u32(fb, &mut buf);
+                    win.update_with_buffer(&buf, 256, 240)?;
                 }
-                win.update_with_buffer(&buf, 256, 240)?;
             }
 
             if result.done || ep_steps > 10_000 {
                 break;
             }
+        }
 
-            // Periodic save
-            if total_steps % 50_000 == 0 {
-                agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
-                save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-                save_recent_rewards(&recent_rewards, "checkpoints")?;
-            }
+        // Periodic save (moved outside inner loop to avoid stalls)
+        if total_steps % 50_000 < ep_steps {
+            agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
+            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+            save_recent_rewards(&recent_rewards, "checkpoints")?;
         }
 
         recent_rewards.push_back(ep_reward);
@@ -1662,6 +1667,8 @@ fn play(args: &PlayArgs) -> Result<()> {
     )?;
     window.set_target_fps(60);
 
+    let mut buf = vec![0u32; 256 * 240];
+
     for ep in 0..args.episodes {
         let mut state = env.reset()?;
         let mut total_reward = 0.0;
@@ -1681,18 +1688,8 @@ fn play(args: &PlayArgs) -> Result<()> {
             }
             state = result.state;
 
-            // Render: convert tetanes RGBA frame to minifb u32 (0xAARRGGBB)
             let fb = env.frame_buffer();
-            let mut buf = vec![0u32; 256 * 240];
-            for (i, pixel) in buf.iter_mut().enumerate() {
-                let base = i * 4; // tetanes outputs 4 bytes per pixel
-                if base + 2 < fb.len() {
-                    let r = fb[base] as u32;
-                    let g = fb[base + 1] as u32;
-                    let b = fb[base + 2] as u32;
-                    *pixel = (r << 16) | (g << 8) | b;
-                }
-            }
+            blit_rgba_to_u32(fb, &mut buf);
             window.update_with_buffer(&buf, 256, 240)?;
 
             if result.done || steps > 20_000 || !window.is_open() {
@@ -1762,6 +1759,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
 
     let mut prev_vals: Vec<u8> = watched.iter().map(|_| 0).collect();
     let mut frame = 0u64;
+    let mut buf = vec![0u32; 256 * 240];
 
     // Auto-press Start to get past title
     env.press_start(120)?;
@@ -1804,14 +1802,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
 
         // Render
         let fb = env.frame_buffer();
-        let mut buf = vec![0u32; 256 * 240];
-        for (i, pixel) in buf.iter_mut().enumerate() {
-            let base = i * 4;
-            if base + 2 < fb.len() {
-                *pixel =
-                    ((fb[base] as u32) << 16) | ((fb[base + 1] as u32) << 8) | fb[base + 2] as u32;
-            }
-        }
+        blit_rgba_to_u32(fb, &mut buf);
         window.update_with_buffer(&buf, 256, 240)?;
 
         // Print RAM every 30 frames (~0.5 sec)
@@ -1938,6 +1929,8 @@ fn manual(args: &ManualArgs) -> Result<()> {
     )?;
     window.set_target_fps(60);
 
+    let mut buf = vec![0u32; 256 * 240];
+
     while window.is_open() {
         update_pause_from_window(&mut env, &window);
         if window.is_key_pressed(minifb::Key::Escape, minifb::KeyRepeat::No) {
@@ -1981,16 +1974,7 @@ fn manual(args: &ManualArgs) -> Result<()> {
         }
 
         let fb = env.frame_buffer();
-        let mut buf = vec![0u32; 256 * 240];
-        for (i, pixel) in buf.iter_mut().enumerate() {
-            let base = i * 4;
-            if base + 2 < fb.len() {
-                let r = fb[base] as u32;
-                let g = fb[base + 1] as u32;
-                let b = fb[base + 2] as u32;
-                *pixel = (r << 16) | (g << 8) | b;
-            }
-        }
+        blit_rgba_to_u32(fb, &mut buf);
         window.update_with_buffer(&buf, 256, 240)?;
     }
 
