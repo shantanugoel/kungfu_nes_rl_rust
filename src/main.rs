@@ -11,12 +11,15 @@
 extern crate accelerate_src;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use candle_core::backprop::GradStore;
+use candle_core::{DType, Device, Tensor, Var};
+use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
@@ -38,6 +41,10 @@ mod ram {
     pub const PLAYER_HP: u16 = 0x04A6;
     pub const PLAYER_POSE: u16 = 0x036E;
     pub const PLAYER_STATE: u16 = 0x036F;
+    // 0x00 = title screen, 0x01 = countdown, 0x02 = demo/playing (see START_TIMER)
+    pub const GAME_MODE: u16 = 0x0062;
+    // Counts down to 0 before player input is accepted
+    pub const START_TIMER: u16 = 0x003A;
 
     // Enemy slots (4 active)
     pub const ENEMY_X: [u16; 4] = [0x00CE, 0x00CF, 0x00D0, 0x00D1];
@@ -171,6 +178,8 @@ pub struct GameState {
     pub player_hp: u8,
     pub player_lives: u8,
     pub player_state: u8,
+    pub game_mode: u8,
+    pub start_timer: u8,
     pub score: u32,
     pub top_score: u32,
     pub kill_count: u8,
@@ -226,6 +235,18 @@ impl GameState {
 }
 
 pub const STATE_DIM: usize = 34; // Must match to_features() length
+const GAME_MODE_TITLE: u8 = 0x00;
+const GAME_MODE_COUNTDOWN: u8 = 0x01;
+const GAME_MODE_ACTION: u8 = 0x02;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionState {
+    Startup,
+    WaitForTitle,
+    WaitForMode2,
+    WaitForCountdown,
+    Playing,
+}
 
 pub struct NesEnv {
     deck: ControlDeck,
@@ -239,6 +260,9 @@ pub struct NesEnv {
     clock_enabled: bool,
     real_time: bool,
     next_frame_deadline: Option<Instant>,
+    session_state: SessionState,
+    countdown_seen: bool,
+    debug_state: bool,
 }
 
 impl NesEnv {
@@ -246,6 +270,8 @@ impl NesEnv {
         let mut deck = ControlDeck::new();
         deck.load_rom_path(&rom_path)
             .with_context(|| format!("Failed to load ROM: {}", rom_path.display()))?;
+
+        let debug_state = Self::debug_state_enabled();
 
         Ok(Self {
             deck,
@@ -259,7 +285,160 @@ impl NesEnv {
             clock_enabled: true,
             real_time: false,
             next_frame_deadline: None,
+            session_state: SessionState::Startup,
+            countdown_seen: false,
+            debug_state,
         })
+    }
+
+    fn debug_state_enabled() -> bool {
+        match std::env::var("KFM_DEBUG_STATE") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    fn is_action_mode(mode: u8) -> bool {
+        mode == GAME_MODE_ACTION || mode == GAME_MODE_COUNTDOWN
+    }
+
+    fn run_state_machine(&mut self, max_frames: u32) -> Result<GameState> {
+        const START_PRESS_FRAMES: u32 = 2;
+        const START_PRESS_INTERVAL: u32 = 30;
+
+        let mut frames = 0u32;
+        let mut since_press = START_PRESS_INTERVAL;
+        let mut last_mode: Option<u8> = None;
+        let mut last_phase: Option<SessionState> = None;
+
+        loop {
+            let state = self.read_state();
+            if state.start_timer > 0 {
+                self.countdown_seen = true;
+            }
+            if self.debug_state {
+                if last_mode != Some(state.game_mode)
+                    || last_phase != Some(self.session_state)
+                    || frames % 120 == 0
+                {
+                    self.log_state("sm", &state);
+                    last_mode = Some(state.game_mode);
+                    last_phase = Some(self.session_state);
+                }
+            }
+
+            match self.session_state {
+                SessionState::Startup => {
+                    if state.game_mode == GAME_MODE_TITLE {
+                        self.session_state = SessionState::WaitForMode2;
+                        self.countdown_seen = false;
+                    } else if Self::is_action_mode(state.game_mode) {
+                        if state.start_timer == 0 {
+                            if self.countdown_seen {
+                                self.session_state = SessionState::Playing;
+                                return Ok(state);
+                            }
+                            self.press_start(START_PRESS_FRAMES)?;
+                            frames = frames.saturating_add(START_PRESS_FRAMES);
+                            self.session_state = SessionState::WaitForTitle;
+                        } else {
+                            self.session_state = SessionState::WaitForCountdown;
+                        }
+                    } else {
+                        self.clock_frame()?;
+                        frames = frames.saturating_add(1);
+                    }
+                }
+                SessionState::WaitForTitle => {
+                    if state.game_mode == GAME_MODE_TITLE {
+                        self.session_state = SessionState::WaitForMode2;
+                        since_press = START_PRESS_INTERVAL;
+                        self.countdown_seen = false;
+                    } else {
+                        self.clock_frame()?;
+                        frames = frames.saturating_add(1);
+                    }
+                }
+                SessionState::WaitForMode2 => {
+                    if state.game_mode == GAME_MODE_TITLE {
+                        if since_press >= START_PRESS_INTERVAL {
+                            if self.debug_state {
+                                eprintln!("[state:sm] press start");
+                            }
+                            self.press_start(START_PRESS_FRAMES)?;
+                            frames = frames.saturating_add(START_PRESS_FRAMES);
+                            since_press = 0;
+                        } else {
+                            self.clock_frame()?;
+                            frames = frames.saturating_add(1);
+                            since_press += 1;
+                        }
+                    } else if state.game_mode == GAME_MODE_COUNTDOWN {
+                        self.session_state = SessionState::WaitForCountdown;
+                    } else if state.game_mode == GAME_MODE_ACTION {
+                        if state.start_timer == 0 {
+                            if self.countdown_seen {
+                                self.session_state = SessionState::Playing;
+                                return Ok(state);
+                            }
+                            if self.debug_state {
+                                eprintln!("[state:sm] demo detected, press start");
+                            }
+                            self.press_start(START_PRESS_FRAMES)?;
+                            frames = frames.saturating_add(START_PRESS_FRAMES);
+                            self.session_state = SessionState::WaitForTitle;
+                            since_press = START_PRESS_INTERVAL;
+                        } else {
+                            self.session_state = SessionState::WaitForCountdown;
+                        }
+                    } else {
+                        self.clock_frame()?;
+                        frames = frames.saturating_add(1);
+                    }
+                }
+                SessionState::WaitForCountdown => {
+                    if state.game_mode == GAME_MODE_TITLE {
+                        self.session_state = SessionState::WaitForMode2;
+                        since_press = START_PRESS_INTERVAL;
+                        self.countdown_seen = false;
+                    } else if Self::is_action_mode(state.game_mode) {
+                        if state.start_timer == 0 {
+                            self.session_state = SessionState::Playing;
+                            return Ok(state);
+                        }
+                        self.clock_frame()?;
+                        frames = frames.saturating_add(1);
+                    } else {
+                        self.clock_frame()?;
+                        frames = frames.saturating_add(1);
+                    }
+                }
+                SessionState::Playing => {
+                    return Ok(state);
+                }
+            }
+
+            if frames >= max_frames {
+                return Ok(state);
+            }
+        }
+    }
+
+    fn log_state(&self, tag: &str, state: &GameState) {
+        if !self.debug_state {
+            return;
+        }
+        eprintln!(
+            "[state:{tag}] phase={phase:?} mode=0x{mode:02X} start_timer={start_timer} lives={lives} hp={hp} score={score} timer={timer} floor={floor}",
+            phase = self.session_state,
+            mode = state.game_mode,
+            start_timer = state.start_timer,
+            lives = state.player_lives,
+            hp = state.player_hp,
+            score = state.score,
+            timer = state.timer,
+            floor = state.floor,
+        );
     }
 
     pub fn set_clock_enabled(&mut self, enabled: bool) {
@@ -335,6 +514,8 @@ impl NesEnv {
         state.player_hp = self.peek(ram::PLAYER_HP);
         state.player_lives = self.peek(ram::PLAYER_LIVES);
         state.player_state = self.peek(ram::PLAYER_STATE);
+        state.game_mode = self.peek(ram::GAME_MODE);
+        state.start_timer = self.peek(ram::START_TIMER);
         state.score = self.read_score();
         state.top_score = ram::TOP_SCORE_DIGITS
             .as_ref()
@@ -385,6 +566,8 @@ impl NesEnv {
     /// Reset the emulator
     pub fn reset(&mut self) -> Result<Vec<f32>> {
         self.deck.reset(ResetKind::Soft);
+        self.session_state = SessionState::Startup;
+        self.countdown_seen = false;
 
         // Random no-op start for stochasticity
         let mut rng = rand::rng();
@@ -393,10 +576,17 @@ impl NesEnv {
             self.clock_frame()?;
         }
 
-        // Press Start to begin game
-        self.press_start(60)?;
-
-        self.prev_state = self.read_state();
+        let state = self.run_state_machine(600)?;
+        self.log_state("reset", &state);
+        if self.session_state != SessionState::Playing {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for play state (phase: {phase:?}, mode: 0x{mode:02X}, start_timer: {timer})",
+                phase = self.session_state,
+                mode = state.game_mode,
+                timer = state.start_timer
+            ));
+        }
+        self.prev_state = state;
         self.total_reward = 0.0;
         self.steps = 0;
         self.last_action = Action::Noop;
@@ -453,12 +643,33 @@ impl NesEnv {
         // Apply action and advance frame_skip frames
         let mut frame_reward = 0.0;
         let mut done = false;
+        let mut playing = true;
+        let mut state = self.read_state();
+
+        if self.session_state != SessionState::Playing {
+            let state = self.run_state_machine(180)?;
+            self.log_state("step-nonplay", &state);
+            playing = false;
+            done = self.session_state != SessionState::Playing;
+            self.prev_state = state;
+            let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
+            return Ok(StepResult {
+                state: self.prev_state.to_features(),
+                reward: 0.0,
+                done,
+                score: self.prev_state.score,
+                total_reward: self.total_reward,
+                kills: self.prev_state.kill_count,
+                active_enemies,
+                playing,
+            });
+        }
 
         for _ in 0..self.frame_skip {
             self.set_input(effective_action);
             self.clock_frame()?;
 
-            let state = self.read_state();
+            state = self.read_state();
 
             // --- Reward computation ---
             let reward = self.compute_reward(&state);
@@ -468,6 +679,8 @@ impl NesEnv {
             if state.player_lives == 0 && self.prev_state.player_lives > 0 {
                 done = true;
                 frame_reward -= 25.0; // Death penalty
+                self.session_state = SessionState::WaitForTitle;
+                self.countdown_seen = false;
             }
 
             self.prev_state = state;
@@ -477,7 +690,9 @@ impl NesEnv {
             }
         }
 
-        self.total_reward += frame_reward;
+        if playing {
+            self.total_reward += frame_reward;
+        }
 
         // Count active enemies
         let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
@@ -490,6 +705,7 @@ impl NesEnv {
             total_reward: self.total_reward,
             kills: self.prev_state.kill_count,
             active_enemies,
+            playing,
         })
     }
 
@@ -554,6 +770,7 @@ pub struct StepResult {
     pub total_reward: f64,
     pub kills: u8,
     pub active_enemies: u8,
+    pub playing: bool,
 }
 
 // =============================================================================
@@ -617,7 +834,7 @@ impl DqnNet {
 // Section 5: Experience Replay Buffer
 // =============================================================================
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Transition {
     state: Vec<f32>,
     action: usize,
@@ -626,6 +843,7 @@ struct Transition {
     done: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ReplayBuffer {
     buffer: VecDeque<Transition>,
     capacity: usize,
@@ -648,6 +866,20 @@ impl ReplayBuffer {
 
     fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let file = File::create(path.as_ref())?;
+        let writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(writer, self)?;
+        Ok(())
+    }
+
+    fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let reader = std::io::BufReader::new(file);
+        let replay = serde_json::from_reader(reader)?;
+        Ok(replay)
     }
 
     /// Sample a random batch, return tensors ready for training
@@ -690,6 +922,54 @@ struct BatchTensors {
     not_dones: Tensor,
 }
 
+#[derive(Serialize, Deserialize)]
+struct TrainMeta {
+    best_reward: f64,
+    episode: u64,
+    total_steps: u64,
+    epsilon: f64,
+    agent_steps: u64,
+}
+
+fn save_checkpoint(
+    agent: &DqnAgent,
+    best_reward: f64,
+    episode: u64,
+    total_steps: u64,
+    dir: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    agent
+        .online_varmap
+        .save(Path::new(dir).join("model.safetensors"))?;
+    agent
+        .target_varmap
+        .save(Path::new(dir).join("target.safetensors"))?;
+    agent.save_optimizer(Path::new(dir).join("optimizer.safetensors"))?;
+    agent.replay.save(Path::new(dir).join("replay.json"))?;
+
+    let meta = TrainMeta {
+        best_reward,
+        episode,
+        total_steps,
+        epsilon: agent.epsilon,
+        agent_steps: agent.steps,
+    };
+    let file = File::create(Path::new(dir).join("meta.json"))?;
+    let writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(writer, &meta)?;
+    Ok(())
+}
+
+fn save_recent_rewards(recent_rewards: &VecDeque<f64>, dir: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let rewards: Vec<f64> = recent_rewards.iter().copied().collect();
+    let file = File::create(Path::new(dir).join("recent_rewards.json"))?;
+    let writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(writer, &rewards)?;
+    Ok(())
+}
+
 // =============================================================================
 // Section 6: DQN Agent
 // =============================================================================
@@ -711,6 +991,126 @@ struct DqnAgent {
     learn_start: usize, // Min replay size before training starts
     train_freq: u64,    // Train every N steps
     steps: u64,
+}
+
+struct AdamW {
+    vars: Vec<VarAdamW>,
+    step_t: usize,
+    params: ParamsAdamW,
+}
+
+struct VarAdamW {
+    var: Var,
+    first_moment: Var,
+    second_moment: Var,
+}
+
+impl AdamW {
+    fn new(vars: Vec<Var>, params: ParamsAdamW) -> Result<Self> {
+        let vars = vars
+            .into_iter()
+            .filter(|var| var.dtype().is_float())
+            .map(|var| {
+                let dtype = var.dtype();
+                let shape = var.shape();
+                let device = var.device();
+                let first_moment = Var::zeros(shape, dtype, device)?;
+                let second_moment = Var::zeros(shape, dtype, device)?;
+                Ok(VarAdamW {
+                    var,
+                    first_moment,
+                    second_moment,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            vars,
+            params,
+            step_t: 0,
+        })
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.params.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.params.lr = lr;
+    }
+
+    fn backward_step(&mut self, loss: &Tensor) -> Result<()> {
+        let grads = loss.backward()?;
+        self.step(&grads)
+    }
+
+    fn step(&mut self, grads: &GradStore) -> Result<()> {
+        self.step_t += 1;
+        let lr = self.params.lr;
+        let lambda = self.params.weight_decay;
+        let lr_lambda = lr * lambda;
+        let beta1 = self.params.beta1;
+        let beta2 = self.params.beta2;
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        for var in self.vars.iter() {
+            let theta = &var.var;
+            let m = &var.first_moment;
+            let v = &var.second_moment;
+            if let Some(g) = grads.get(theta) {
+                let next_m = ((m.as_tensor() * beta1)? + (g * (1.0 - beta1))?)?;
+                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
+                let m_hat = (&next_m * scale_m)?;
+                let v_hat = (&next_v * scale_v)?;
+                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
+                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
+                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
+                m.set(&next_m)?;
+                v.set(&next_v)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            "adamw.step_t".to_string(),
+            Tensor::from_slice(&[self.step_t as u32], 1, &Device::Cpu)?,
+        );
+        for (i, var) in self.vars.iter().enumerate() {
+            tensors.insert(
+                format!("adamw.m.{i}"),
+                var.first_moment.as_tensor().detach(),
+            );
+            tensors.insert(
+                format!("adamw.v.{i}"),
+                var.second_moment.as_tensor().detach(),
+            );
+        }
+        candle_core::safetensors::save(&tensors, path.as_ref())?;
+        Ok(())
+    }
+
+    fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let tensors = candle_core::safetensors::load(path.as_ref(), &Device::Cpu)?;
+        let step_t = tensors
+            .get("adamw.step_t")
+            .context("Missing adamw.step_t in optimizer state")?
+            .to_vec1::<u32>()?;
+        self.step_t = step_t.get(0).copied().unwrap_or(0) as usize;
+        for (i, var) in self.vars.iter().enumerate() {
+            let m = tensors
+                .get(&format!("adamw.m.{i}"))
+                .context("Missing adamw.m tensor in optimizer state")?;
+            let v = tensors
+                .get(&format!("adamw.v.{i}"))
+                .context("Missing adamw.v tensor in optimizer state")?;
+            var.first_moment.set(m)?;
+            var.second_moment.set(v)?;
+        }
+        Ok(())
+    }
 }
 
 impl DqnAgent {
@@ -752,6 +1152,24 @@ impl DqnAgent {
         };
         agent.hard_update_target()?;
         Ok(agent)
+    }
+
+    fn resume_from(&mut self, resume_dir: &Path) -> Result<(TrainMeta, ReplayBuffer)> {
+        let model_path = resume_dir.join("model.safetensors");
+        let target_path = resume_dir.join("target.safetensors");
+        let optimizer_path = resume_dir.join("optimizer.safetensors");
+        let replay_path = resume_dir.join("replay.json");
+        let meta_path = resume_dir.join("meta.json");
+
+        self.online_varmap.load(&model_path)?;
+        self.target_varmap.load(&target_path)?;
+        self.load_optimizer(&optimizer_path)?;
+        let replay = ReplayBuffer::load(&replay_path)?;
+
+        let file = File::open(&meta_path)?;
+        let reader = std::io::BufReader::new(file);
+        let meta: TrainMeta = serde_json::from_reader(reader)?;
+        Ok((meta, replay))
     }
 
     /// Select action using epsilon-greedy
@@ -892,6 +1310,14 @@ impl DqnAgent {
         eprintln!("📂 Model loaded from {path}");
         Ok(())
     }
+
+    fn save_optimizer<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.optimizer.save_state(path)
+    }
+
+    fn load_optimizer<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        self.optimizer.load_state(path)
+    }
 }
 
 // =============================================================================
@@ -914,7 +1340,6 @@ fn train(args: &TrainArgs) -> Result<()> {
     )?;
     env.set_clock_enabled(!args.no_clock);
     env.set_real_time(args.real_time);
-    env.press_start(60)?;
 
     let mut window = if args.render {
         Some(minifb::Window::new(
@@ -939,8 +1364,24 @@ fn train(args: &TrainArgs) -> Result<()> {
     std::fs::create_dir_all("checkpoints")?;
 
     let mut best_reward = f64::NEG_INFINITY;
-    let mut episode = 0;
+    let mut episode: u64 = 0;
     let mut total_steps: u64 = 0;
+    if let Some(resume_dir) = args.resume.as_ref() {
+        let (meta, replay) = agent.resume_from(resume_dir)?;
+        best_reward = meta.best_reward;
+        episode = meta.episode;
+        total_steps = meta.total_steps;
+        agent.epsilon = meta.epsilon;
+        agent.steps = meta.agent_steps;
+        agent.replay = replay;
+        eprintln!(
+            "📦 Resumed from {} (steps={}, episode={}, epsilon={:.4})",
+            resume_dir.display(),
+            total_steps,
+            episode,
+            agent.epsilon
+        );
+    }
     let t_start = Instant::now();
 
     let mut last_render_ep = 0u64;
@@ -953,11 +1394,19 @@ fn train(args: &TrainArgs) -> Result<()> {
 
     // Episode stats for logging
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(100);
+    if let Some(resume_dir) = args.resume.as_ref() {
+        let rewards_path = resume_dir.join("recent_rewards.json");
+        if rewards_path.exists() {
+            let file = File::open(&rewards_path)?;
+            let reader = std::io::BufReader::new(file);
+            let rewards: Vec<f64> = serde_json::from_reader(reader)?;
+            recent_rewards = VecDeque::from(rewards);
+        }
+    }
 
     while total_steps < args.timesteps {
         episode += 1;
         let mut state = env.reset()?;
-        env.press_start(60)?;
         let mut ep_reward = 0.0;
         let mut ep_steps = 0u64;
         let mut ep_loss = 0.0f32;
@@ -977,25 +1426,27 @@ fn train(args: &TrainArgs) -> Result<()> {
             }
             let action_idx = agent.select_action(&state)?;
             let result = env.step(Action::from_index(action_idx))?;
+            if result.playing {
+                agent.remember(Transition {
+                    state: state.clone(),
+                    action: action_idx,
+                    reward: result.reward,
+                    next_state: result.state.clone(),
+                    done: result.done,
+                });
 
-            agent.remember(Transition {
-                state: state.clone(),
-                action: action_idx,
-                reward: result.reward,
-                next_state: result.state.clone(),
-                done: result.done,
-            });
+                let loss = agent.train_step()?;
+                if loss > 0.0 {
+                    ep_loss += loss;
+                    loss_count += 1;
+                }
 
-            let loss = agent.train_step()?;
-            if loss > 0.0 {
-                ep_loss += loss;
-                loss_count += 1;
+                ep_reward += result.reward as f64;
+                ep_steps += 1;
+                total_steps += 1;
             }
 
             state = result.state;
-            ep_reward += result.reward as f64;
-            ep_steps += 1;
-            total_steps += 1;
 
             if let Some(win) = window.as_mut() {
                 let overlay_ep = if last_render_ep == 0 {
@@ -1057,6 +1508,8 @@ fn train(args: &TrainArgs) -> Result<()> {
             // Periodic save
             if total_steps % 50_000 == 0 {
                 agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
+                save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+                save_recent_rewards(&recent_rewards, "checkpoints")?;
             }
         }
 
@@ -1075,6 +1528,8 @@ fn train(args: &TrainArgs) -> Result<()> {
         if ep_reward > best_reward {
             best_reward = ep_reward;
             agent.save("checkpoints/best.safetensors")?;
+            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+            save_recent_rewards(&recent_rewards, "checkpoints")?;
         }
 
         let elapsed = t_start.elapsed().as_secs_f64();
@@ -1103,6 +1558,8 @@ fn train(args: &TrainArgs) -> Result<()> {
     }
 
     agent.save("checkpoints/final.safetensors")?;
+    save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+    save_recent_rewards(&recent_rewards, "checkpoints")?;
     eprintln!(
         "\n✅ Training complete. {total_steps} steps in {:.1}s",
         t_start.elapsed().as_secs_f64()
@@ -1127,7 +1584,6 @@ fn play(args: &PlayArgs) -> Result<()> {
     let mut agent = DqnAgent::new(&device)?;
     agent.load(&args.model.to_string_lossy())?;
     agent.epsilon = 0.0; // Greedy during evaluation
-    env.press_start(60)?;
 
     // Create display window (NES native res: 256×240)
     let mut window = minifb::Window::new(
@@ -1144,7 +1600,6 @@ fn play(args: &PlayArgs) -> Result<()> {
 
     for ep in 0..args.episodes {
         let mut state = env.reset()?;
-        env.press_start(60)?;
         let mut total_reward = 0.0;
         let mut steps = 0u64;
 
@@ -1156,10 +1611,11 @@ fn play(args: &PlayArgs) -> Result<()> {
             }
             let action_idx = agent.select_action(&state)?;
             let result = env.step(Action::from_index(action_idx))?;
-
+            if result.playing {
+                total_reward += result.reward as f64;
+                steps += 1;
+            }
             state = result.state;
-            total_reward += result.reward as f64;
-            steps += 1;
 
             // Render: convert tetanes RGBA frame to minifb u32 (0xAARRGGBB)
             let fb = env.frame_buffer();
@@ -1226,6 +1682,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
     window.set_target_fps(60);
 
     let watched: Vec<(&str, u16)> = vec![
+        ("Game Mode", ram::GAME_MODE),
         ("Player X", ram::PLAYER_X),
         ("Player Y", ram::PLAYER_Y),
         ("Player HP", ram::PLAYER_HP),
@@ -1525,6 +1982,8 @@ struct TrainArgs {
     no_clock: bool,
     #[arg(long, default_value_t = false)]
     real_time: bool,
+    #[arg(long)]
+    resume: Option<PathBuf>,
 }
 
 #[derive(Parser)]
