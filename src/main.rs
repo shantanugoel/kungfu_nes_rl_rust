@@ -15,8 +15,8 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use rand::Rng;
 use rand::rngs::SmallRng;
+use rand::Rng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -60,6 +60,11 @@ mod ram {
     pub const ENEMY_Y: [u16; 4] = [0x00B0, 0x00B1, 0x00B2, 0x00B3];
     pub const ENEMY_FACING: [u16; 4] = [0x00C0, 0x00C1, 0x00C2, 0x00C3];
     pub const ENEMY_POSE: [u16; 4] = [0x00DF, 0x00E0, 0x00E1, 0x00E2];
+
+    // Knife/projectile slots (4 active)
+    pub const KNIFE_X: [u16; 4] = [0x03D4, 0x03D5, 0x03D6, 0x03D7];
+    pub const KNIFE_Y: [u16; 4] = [0x03D0, 0x03D1, 0x03D2, 0x03D3];
+    pub const KNIFE_STATE: [u16; 4] = [0x03EC, 0x03ED, 0x03EE, 0x03EF];
 
     pub const KILL_COUNTER: u16 = 0x03B1;
 
@@ -196,6 +201,10 @@ pub struct GameState {
     pub enemy_type: [u8; 4],
     pub enemy_facing: [u8; 4],
     pub enemy_active: [bool; 4],
+    pub knife_x: [u8; 4],
+    pub knife_y: [u8; 4],
+    pub knife_facing: [u8; 4],
+    pub knife_active: [bool; 4],
     pub boss_hp: u8,
     pub floor: u8,
     pub timer: u8,
@@ -208,17 +217,23 @@ impl GameState {
         let mut f = [0f32; STATE_DIM];
         let mut idx = 0;
 
-        f[idx] = self.player_x as f32 / 255.0; idx += 1;
-        f[idx] = self.player_y as f32 / 255.0; idx += 1;
+        f[idx] = self.player_x as f32 / 255.0;
+        idx += 1;
+        f[idx] = self.player_y as f32 / 255.0;
+        idx += 1;
         let hp = if self.player_hp == 0xFF {
             0.0
         } else {
             self.player_hp as f32
         };
-        f[idx] = hp / 176.0; idx += 1;
-        f[idx] = self.player_lives as f32 / 5.0; idx += 1;
-        f[idx] = self.player_state as f32 / 255.0; idx += 1;
-        f[idx] = self.floor as f32 / 5.0; idx += 1;
+        f[idx] = hp / 176.0;
+        idx += 1;
+        f[idx] = self.player_lives as f32 / 5.0;
+        idx += 1;
+        f[idx] = self.player_state as f32 / 255.0;
+        idx += 1;
+        f[idx] = self.floor as f32 / 5.0;
+        idx += 1;
 
         #[derive(Clone, Copy)]
         struct EnemyFeatures {
@@ -264,23 +279,52 @@ impl GameState {
         });
 
         for enemy in &enemies {
-            f[idx] = enemy.active; idx += 1;
-            f[idx] = enemy.dx; idx += 1;
-            f[idx] = enemy.dy; idx += 1;
-            f[idx] = enemy.abs_dx; idx += 1;
-            f[idx] = enemy.enemy_type; idx += 1;
-            f[idx] = enemy.facing; idx += 1;
+            f[idx] = enemy.active;
+            idx += 1;
+            f[idx] = enemy.dx;
+            idx += 1;
+            f[idx] = enemy.dy;
+            idx += 1;
+            f[idx] = enemy.abs_dx;
+            idx += 1;
+            f[idx] = enemy.enemy_type;
+            idx += 1;
+            f[idx] = enemy.facing;
+            idx += 1;
         }
 
-        f[idx] = self.boss_hp as f32 / 255.0; idx += 1;
-        f[idx] = self.timer as f32 / 255.0; idx += 1;
+        for i in 0..4 {
+            let active = self.knife_active[i];
+            f[idx] = if active { 1.0 } else { 0.0 };
+            idx += 1;
+            if active {
+                f[idx] = self.knife_x[i] as f32 / 255.0;
+                idx += 1;
+                f[idx] = self.knife_y[i] as f32 / 255.0;
+                idx += 1;
+                f[idx] = self.knife_facing[i] as f32;
+                idx += 1;
+            } else {
+                f[idx] = 0.0;
+                idx += 1;
+                f[idx] = 0.0;
+                idx += 1;
+                f[idx] = 0.0;
+                idx += 1;
+            }
+        }
+
+        f[idx] = self.boss_hp as f32 / 255.0;
+        idx += 1;
+        f[idx] = self.timer as f32 / 255.0;
+        idx += 1;
         f[idx] = self.kill_count as f32 / 255.0;
 
         f
     }
 }
 
-pub const STATE_DIM: usize = 33; // Must match to_features() length
+pub const STATE_DIM: usize = 49; // Must match to_features() length
 const GAME_MODE_TITLE: u8 = 0x00;
 const GAME_MODE_COUNTDOWN: u8 = 0x01;
 const GAME_MODE_ACTION: u8 = 0x02;
@@ -591,6 +635,16 @@ impl NesEnv {
             state.enemy_facing[i] = self.peek(ram::ENEMY_FACING[i]);
             let pose = self.peek(ram::ENEMY_POSE[i]);
             state.enemy_active[i] = pose != 0 && pose != 0x7F;
+
+            state.knife_x[i] = self.peek(ram::KNIFE_X[i]);
+            state.knife_y[i] = self.peek(ram::KNIFE_Y[i]);
+            let knife_state = self.peek(ram::KNIFE_STATE[i]);
+            state.knife_active[i] = knife_state != 0;
+            state.knife_facing[i] = match knife_state {
+                0x11 => 1,
+                0x01 => 0,
+                _ => 0,
+            };
         }
         state
     }
@@ -1046,9 +1100,9 @@ struct DqnAgent {
     tau: f64, // Soft update coefficient
     replay: ReplayBuffer,
     batch_size: usize,
-    learn_start: usize,        // Min replay size before training starts
-    train_freq: u64,           // Train every N steps
-    target_update_freq: u64,   // Hard-update target every N gradient steps
+    learn_start: usize,      // Min replay size before training starts
+    train_freq: u64,         // Train every N steps
+    target_update_freq: u64, // Hard-update target every N gradient steps
     steps: u64,
     rng: SmallRng,
 }
@@ -1245,7 +1299,10 @@ impl DqnAgent {
         } else {
             let s = Tensor::from_slice(state, (1, STATE_DIM), &self.device)?;
             let q = self.online_net.forward(&s)?;
-            let action = q.argmax(candle_core::D::Minus1)?.squeeze(0)?.to_scalar::<u32>()? as usize;
+            let action = q
+                .argmax(candle_core::D::Minus1)?
+                .squeeze(0)?
+                .to_scalar::<u32>()? as usize;
             Ok(action)
         }
     }
@@ -1265,7 +1322,9 @@ impl DqnAgent {
             return Ok(0.0);
         }
 
-        let batch = self.replay.sample(self.batch_size, &self.device, &mut self.rng)?;
+        let batch = self
+            .replay
+            .sample(self.batch_size, &self.device, &mut self.rng)?;
 
         // Online net: Q(s, a) for the actions we actually took
         let q_all = self.online_net.forward(&batch.states)?;
@@ -1283,9 +1342,7 @@ impl DqnAgent {
 
         // Target: r + gamma * Q_target(s', argmax_a Q_online(s', a)) * (1 - done)
         let discounted = next_q.affine(self.gamma, 0.0)?;
-        let target = batch
-            .rewards
-            .add(&discounted.mul(&batch.not_dones)?)?;
+        let target = batch.rewards.add(&discounted.mul(&batch.not_dones)?)?;
 
         // Huber loss (smooth L1) — more robust than MSE for RL
         let diff = q_values.sub(&target.detach())?;

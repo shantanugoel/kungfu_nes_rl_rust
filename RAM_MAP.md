@@ -17,6 +17,10 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x00B0 - 0x00B3` | `ENEMY_Y` | 4 | Y positions for enemy slots 0 through 3. | 0-255 (screen-space). |
 | `0x00C0 - 0x00C3` | `ENEMY_FACING` | 4 | Facing direction for enemy slots 0 through 3. | 0/1 (L/R). |
 | `0x00DF - 0x00E2` | `ENEMY_POSE` | 4 | Animation/pose state for enemy slots 0 through 3. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x03D4 - 0x03D7` | `KNIFE_X` | 4 | Knife projectile X positions for slots 0 through 3. | 0-255; 0 or `0xF9` when off-screen. |
+| `0x03D0 - 0x03D3` | `KNIFE_Y` | 4 | Knife projectile Y positions for slots 0 through 3. | 0-255 (screen-space). |
+| `0x03EC - 0x03EF` | `KNIFE_STATE` | 4 | Knife active + facing for slots 0 through 3. | `0x00` inactive, `0x11` facing right, `0x01` facing left. |
+| `0x03F0 - 0x03F3` | `KNIFE_THROW_SEQ` | 4 | Knife throw sequence counter for slots 0 through 3. | Increments on throw; cycles 0-3. |
 | `0x03B1` | `KILL_COUNTER` | 1 | Total number of enemies defeated in current run. | Monotonic counter, wraps at 255. |
 | `0x0531 - 0x0536` | `SCORE_DIGITS` | 6 | BCD-encoded score digits. | Each byte is a single digit 0-9 (low nibble). |
 | `0x0501 - 0x0506` | `TOP_SCORE_DIGITS` | 6 | BCD-encoded score digits. | Each byte is a single digit 0-9 (low nibble). |
@@ -53,3 +57,6 @@ High nibble:
 - 1: kicking
 - 2: punching
 - (possible 1/2 combo for attacking)
+
+### Knife/Projectile Behavior
+Use `KNIFE_STATE` to determine active projectiles; treat `KNIFE_X` and `KNIFE_Y` as valid only when the corresponding state is nonzero.
