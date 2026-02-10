@@ -14,79 +14,15 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use rand::Rng;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
-use tracing_subscriber::fmt::MakeWriter;
-
-fn drain_pause_toggle(env: &mut NesEnv) -> Result<()> {
-    while event::poll(std::time::Duration::from_millis(0))? {
-        if let Event::Key(key) = event::read()? {
-            if key.code == KeyCode::Char(' ') && key.kind == KeyEventKind::Press {
-                env.toggle_pause();
-            }
-        }
-    }
-    Ok(())
-}
-
-fn drain_exit_signal() -> Result<bool> {
-    while event::poll(std::time::Duration::from_millis(0))? {
-        if let Event::Key(key) = event::read()? {
-            if key.code == KeyCode::Char('c')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.kind == KeyEventKind::Press
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-struct PauseGuard;
-
-impl PauseGuard {
-    fn new() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for PauseGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-#[derive(Clone, Debug)]
-struct StderrLineWriter;
-
-impl Write for StderrLineWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut stderr = std::io::stderr();
-        stderr.write_all(buf)?;
-        if !buf.ends_with(b"\n") {
-            stderr.write_all(b"\n")?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stderr().flush()
-    }
-}
-
-impl<'a> MakeWriter<'a> for StderrLineWriter {
-    type Writer = StderrLineWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        Self
+fn update_pause_from_window(env: &mut NesEnv, window: &minifb::Window) {
+    if window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::No) {
+        env.toggle_pause();
     }
 }
 
@@ -914,8 +850,6 @@ fn train(args: &TrainArgs) -> Result<()> {
     eprintln!("  TRAINING — Kung Fu Master DQN Agent (Rust + candle)");
     eprintln!("═══════════════════════════════════════════════════════════");
 
-    let _pause_guard = PauseGuard::new()?;
-
     // Select device: Metal on Apple Silicon, else CPU
     let device = Device::new_metal(0).unwrap_or(Device::Cpu);
     eprintln!("Device: {:?}", device);
@@ -974,10 +908,12 @@ fn train(args: &TrainArgs) -> Result<()> {
         let mut loss_count = 0u32;
 
         loop {
-            drain_pause_toggle(&mut env)?;
-            if drain_exit_signal()? {
-                eprintln!("\nInterrupted (Ctrl+C). Exiting training loop.");
-                return Ok(());
+            if let Some(win) = window.as_ref() {
+                update_pause_from_window(&mut env, win);
+                if !win.is_open() {
+                    eprintln!("\nRender window closed. Exiting training loop.");
+                    return Ok(());
+                }
             }
             env.step_pause()?;
             if env.is_paused() {
@@ -1006,10 +942,6 @@ fn train(args: &TrainArgs) -> Result<()> {
             total_steps += 1;
 
             if let Some(win) = window.as_mut() {
-                if !win.is_open() {
-                    eprintln!("\nRender window closed. Exiting training loop.");
-                    return Ok(());
-                }
                 let overlay_ep = if last_render_ep == 0 {
                     episode
                 } else {
@@ -1124,8 +1056,6 @@ fn play(args: &PlayArgs) -> Result<()> {
     eprintln!("  PLAYING — Kung Fu Master DQN Agent");
     eprintln!("═══════════════════════════════════════════════════════════");
 
-    let _pause_guard = PauseGuard::new()?;
-
     let device = Device::new_metal(0).unwrap_or(Device::Cpu);
 
     let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
@@ -1154,11 +1084,7 @@ fn play(args: &PlayArgs) -> Result<()> {
         let mut steps = 0u64;
 
         loop {
-            drain_pause_toggle(&mut env)?;
-            if drain_exit_signal()? {
-                eprintln!("\nInterrupted (Ctrl+C). Exiting play loop.");
-                return Ok(());
-            }
+            update_pause_from_window(&mut env, &window);
             env.step_pause()?;
             if env.is_paused() {
                 continue;
@@ -1219,8 +1145,6 @@ fn explore(args: &ExploreArgs) -> Result<()> {
 
     let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
 
-    let _pause_guard = PauseGuard::new()?;
-
     let mut window = minifb::Window::new(
         "Kung Fu — RAM Explorer",
         256,
@@ -1254,14 +1178,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
     env.press_start(120)?;
 
     while window.is_open() {
-        if drain_exit_signal()? {
-            eprintln!("\nInterrupted (Ctrl+C). Exiting explore loop.");
-            break;
-        }
-        if window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::No) {
-            env.toggle_pause();
-        }
-        drain_pause_toggle(&mut env)?;
+        update_pause_from_window(&mut env, &window);
         if env.is_paused() {
             env.step_pause()?;
             continue;
@@ -1361,8 +1278,6 @@ fn explore(args: &ExploreArgs) -> Result<()> {
 fn baseline(args: &BaselineArgs) -> Result<()> {
     eprintln!("Running random agent baseline...");
 
-    let _pause_guard = PauseGuard::new()?;
-
     let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
     let mut rng = rand::rng();
     let mut rewards = Vec::new();
@@ -1373,11 +1288,6 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
         let mut steps = 0u64;
 
         loop {
-            drain_pause_toggle(&mut env)?;
-            if drain_exit_signal()? {
-                eprintln!("\nInterrupted (Ctrl+C). Exiting baseline loop.");
-                return Ok(());
-            }
             env.step_pause()?;
             if env.is_paused() {
                 continue;
@@ -1418,8 +1328,6 @@ fn manual(args: &ManualArgs) -> Result<()> {
     eprintln!("Arrows: Move | Z: B (Punch) | X: A (Kick) | A: Select | S: Start");
     eprintln!("Space: Pause | Esc: Quit");
 
-    let _pause_guard = PauseGuard::new()?;
-
     let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
     let _ = env.reset()?;
     env.press_start(60)?;
@@ -1437,11 +1345,7 @@ fn manual(args: &ManualArgs) -> Result<()> {
     window.set_target_fps(60);
 
     while window.is_open() {
-        if drain_exit_signal()? {
-            eprintln!("\nInterrupted (Ctrl+C). Exiting manual loop.");
-            break;
-        }
-        drain_pause_toggle(&mut env)?;
+        update_pause_from_window(&mut env, &window);
         if window.is_key_pressed(minifb::Key::Escape, minifb::KeyRepeat::No) {
             break;
         }
@@ -1570,8 +1474,7 @@ struct BaselineArgs {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
-        .with_writer(StderrLineWriter)
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
     let cli = Cli::parse();
