@@ -14,13 +14,15 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use rand::Rng;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
+use tracing_subscriber::fmt::MakeWriter;
 
 fn drain_pause_toggle(env: &mut NesEnv) -> Result<()> {
     while event::poll(std::time::Duration::from_millis(0))? {
@@ -31,6 +33,20 @@ fn drain_pause_toggle(env: &mut NesEnv) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn drain_exit_signal() -> Result<bool> {
+    while event::poll(std::time::Duration::from_millis(0))? {
+        if let Event::Key(key) = event::read()? {
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.kind == KeyEventKind::Press
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 struct PauseGuard;
@@ -48,6 +64,40 @@ impl Drop for PauseGuard {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StderrPrefixWriter;
+
+impl Write for StderrPrefixWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut stderr = std::io::stderr();
+        let mut start = 0;
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' {
+                stderr.write_all(b"[tetanes] ")?;
+                stderr.write_all(&buf[start..=i])?;
+                start = i + 1;
+            }
+        }
+        if start < buf.len() {
+            stderr.write_all(b"[tetanes] ")?;
+            stderr.write_all(&buf[start..])?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for StderrPrefixWriter {
+    type Writer = StderrPrefixWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        Self
+    }
+}
+
 // =============================================================================
 // Section 1: RAM Addresses — YOUR confirmed addresses
 // =============================================================================
@@ -58,6 +108,8 @@ mod ram {
     pub const PLAYER_X: u16 = 0x00D4;
     pub const PLAYER_Y: u16 = 0x00B6;
     pub const PLAYER_HP: u16 = 0x04A6;
+    pub const PLAYER_POSE: u16 = 0x036E;
+    pub const PLAYER_STATE: u16 = 0x036F;
 
     // Enemy slots (4 active)
     pub const ENEMY_X: [u16; 4] = [0x00CE, 0x00CF, 0x00D0, 0x00D1];
@@ -71,14 +123,13 @@ mod ram {
     // Score: 6 BCD digits
     pub const SCORE_DIGITS: [u16; 6] = [0x0531, 0x0532, 0x0533, 0x0534, 0x0535, 0x0536];
 
+    // Timer: 4 BCD digits
+    pub const TIMER_DIGITS: [u16; 4] = [0x0390, 0x0391, 0x0392, 0x0393];
+
     // TODO: Discover these for your ROM using explore mode
-    // WARNING: 0x0534 collides with SCORE_DIGITS[3] (score_100)!
-    // This is a placeholder — scan during a boss fight to find the real address.
-    // Until found, the KILL_COUNTER reward carries combat weight for boss fights too.
-    pub const BOSS_HP: u16 = 0x0534; // VERIFY! Almost certainly wrong — collides with score
+    // WARNING: 0x0534 collides with SCORE_DIGITS[3] (score_100).
+    pub const BOSS_HP: Option<u16> = None; // Unknown in this ROM
     pub const FLOOR: u16 = 0x0058; // Verify! Try scanning during floor transition
-    pub const TIMER: u16 = 0x002E; // Verify!
-    pub const PLAYER_STATE: u16 = 0x0050; // Verify!
 }
 
 // =============================================================================
@@ -290,6 +341,17 @@ impl NesEnv {
         score
     }
 
+    /// Read BCD timer from 4 digit bytes
+    fn read_timer(&self) -> u16 {
+        let mut timer = 0u16;
+        let multipliers = [1000, 100, 10, 1];
+        for (i, &addr) in ram::TIMER_DIGITS.iter().enumerate() {
+            let digit = self.peek(addr) & 0x0F;
+            timer += digit as u16 * multipliers[i];
+        }
+        timer
+    }
+
     /// Extract full game state from RAM
     fn read_state(&self) -> GameState {
         let mut state = GameState::default();
@@ -300,9 +362,9 @@ impl NesEnv {
         state.player_state = self.peek(ram::PLAYER_STATE);
         state.score = self.read_score();
         state.kill_count = self.peek(ram::KILL_COUNTER);
-        state.boss_hp = self.peek(ram::BOSS_HP);
+        state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
         state.floor = self.peek(ram::FLOOR);
-        state.timer = self.peek(ram::TIMER);
+        state.timer = (self.read_timer().min(u8::MAX as u16)) as u8;
 
         for i in 0..4 {
             state.enemy_x[i] = self.peek(ram::ENEMY_X[i]);
@@ -795,9 +857,20 @@ impl DqnAgent {
 
     /// Copy online weights → target (hard copy)
     fn hard_update_target(&mut self) -> Result<()> {
-        let online_data = self.online_varmap.all_vars();
-        let target_data = self.target_varmap.all_vars();
-        for (online_v, target_v) in online_data.iter().zip(target_data.iter()) {
+        let online_data = self
+            .online_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock online varmap for hard update"))?;
+        let mut target_data = self
+            .target_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock target varmap for hard update"))?;
+        for (name, target_v) in target_data.iter_mut() {
+            let online_v = online_data.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Missing var {name} in online varmap during hard update")
+            })?;
             target_v.set(&online_v.as_tensor().detach())?;
         }
         Ok(())
@@ -806,9 +879,20 @@ impl DqnAgent {
     /// Soft update: target = tau * online + (1-tau) * target
     fn soft_update_target(&mut self) -> Result<()> {
         let tau = self.tau as f32;
-        let online_data = self.online_varmap.all_vars();
-        let target_data = self.target_varmap.all_vars();
-        for (online_v, target_v) in online_data.iter().zip(target_data.iter()) {
+        let online_data = self
+            .online_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock online varmap for soft update"))?;
+        let mut target_data = self
+            .target_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock target varmap for soft update"))?;
+        for (name, target_v) in target_data.iter_mut() {
+            let online_v = online_data.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Missing var {name} in online varmap during soft update")
+            })?;
             let new_val = online_v
                 .as_tensor()
                 .affine(tau as f64, 0.0)?
@@ -856,6 +940,23 @@ fn train(args: &TrainArgs) -> Result<()> {
     )?;
     env.press_start(60)?;
 
+    let mut window = if args.render {
+        Some(minifb::Window::new(
+            "Kung Fu Master — Training",
+            256,
+            240,
+            minifb::WindowOptions {
+                scale: minifb::Scale::X2,
+                ..Default::default()
+            },
+        )?)
+    } else {
+        None
+    };
+    if let Some(win) = window.as_mut() {
+        win.set_target_fps(60);
+    }
+
     let mut agent = DqnAgent::new(&device)?;
 
     std::fs::create_dir_all("checkpoints")?;
@@ -879,6 +980,10 @@ fn train(args: &TrainArgs) -> Result<()> {
 
         loop {
             drain_pause_toggle(&mut env)?;
+            if drain_exit_signal()? {
+                eprintln!("\nInterrupted (Ctrl+C). Exiting training loop.");
+                return Ok(());
+            }
             env.step_pause()?;
             if env.is_paused() {
                 continue;
@@ -904,6 +1009,25 @@ fn train(args: &TrainArgs) -> Result<()> {
             ep_reward += result.reward as f64;
             ep_steps += 1;
             total_steps += 1;
+
+            if let Some(win) = window.as_mut() {
+                if !win.is_open() {
+                    eprintln!("\nRender window closed. Exiting training loop.");
+                    return Ok(());
+                }
+                let fb = env.frame_buffer();
+                let mut buf = vec![0u32; 256 * 240];
+                for (i, pixel) in buf.iter_mut().enumerate() {
+                    let base = i * 4;
+                    if base + 2 < fb.len() {
+                        let r = fb[base] as u32;
+                        let g = fb[base + 1] as u32;
+                        let b = fb[base + 2] as u32;
+                        *pixel = (r << 16) | (g << 8) | b;
+                    }
+                }
+                win.update_with_buffer(&buf, 256, 240)?;
+            }
 
             if result.done || ep_steps > 10_000 {
                 break;
@@ -995,6 +1119,10 @@ fn play(args: &PlayArgs) -> Result<()> {
 
         loop {
             drain_pause_toggle(&mut env)?;
+            if drain_exit_signal()? {
+                eprintln!("\nInterrupted (Ctrl+C). Exiting play loop.");
+                return Ok(());
+            }
             env.step_pause()?;
             if env.is_paused() {
                 continue;
@@ -1073,13 +1201,13 @@ fn explore(args: &ExploreArgs) -> Result<()> {
         ("Player Y", ram::PLAYER_Y),
         ("Player HP", ram::PLAYER_HP),
         ("Player Lives", ram::PLAYER_LIVES),
+        ("Player Pose", ram::PLAYER_POSE),
         ("Player State", ram::PLAYER_STATE),
         ("Kill Count", ram::KILL_COUNTER),
         ("Enemy0 X", ram::ENEMY_X[0]),
         ("Enemy0 Type", ram::ENEMY_TYPE[0]),
-        ("Boss HP", ram::BOSS_HP),
+        ("Boss HP", ram::BOSS_HP.unwrap_or(0x0000)),
         ("Floor", ram::FLOOR),
-        ("Timer", ram::TIMER),
     ];
 
     let mut prev_vals: Vec<u8> = watched.iter().map(|_| 0).collect();
@@ -1089,6 +1217,10 @@ fn explore(args: &ExploreArgs) -> Result<()> {
     env.press_start(120)?;
 
     while window.is_open() {
+        if drain_exit_signal()? {
+            eprintln!("\nInterrupted (Ctrl+C). Exiting explore loop.");
+            break;
+        }
         if window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::No) {
             env.toggle_pause();
         }
@@ -1143,6 +1275,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
         if frame % 30 == 0 {
             println!("\r\n--- Frame {frame} ---");
             println!("\r  Score: {}", env.read_score());
+            println!("\r  Timer: {}", env.read_timer());
             println!("\r  Kill Count: {}", env.peek(ram::KILL_COUNTER));
             for (i, (name, addr)) in watched.iter().enumerate() {
                 let val = env.peek(*addr);
@@ -1204,6 +1337,10 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
 
         loop {
             drain_pause_toggle(&mut env)?;
+            if drain_exit_signal()? {
+                eprintln!("\nInterrupted (Ctrl+C). Exiting baseline loop.");
+                return Ok(());
+            }
             env.step_pause()?;
             if env.is_paused() {
                 continue;
@@ -1262,6 +1399,10 @@ fn manual(args: &ManualArgs) -> Result<()> {
     window.set_target_fps(60);
 
     while window.is_open() {
+        if drain_exit_signal()? {
+            eprintln!("\nInterrupted (Ctrl+C). Exiting manual loop.");
+            break;
+        }
         drain_pause_toggle(&mut env)?;
         if window.is_key_pressed(minifb::Key::Escape, minifb::KeyRepeat::No) {
             break;
@@ -1359,6 +1500,8 @@ struct TrainArgs {
     timesteps: u64,
     #[arg(long, default_value = "4")]
     frame_skip: u32,
+    #[arg(long, default_value_t = false)]
+    render: bool,
 }
 
 #[derive(Parser)]
@@ -1390,6 +1533,7 @@ struct BaselineArgs {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .with_writer(StderrPrefixWriter)
         .init();
 
     let cli = Cli::parse();
