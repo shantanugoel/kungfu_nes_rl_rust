@@ -1048,7 +1048,7 @@ fn worker_loop(
                 break;
             }
 
-            if worker_steps % 500 == 0 {
+            if worker_steps.is_multiple_of(500) {
                 let snap = shared_weights.read().unwrap();
                 if snap.version > local_weight_version {
                     let _ = load_snapshot_into_varmap(&snap, &local_varmap);
@@ -1172,7 +1172,7 @@ impl DqnAgent {
             return Ok(0.0);
         }
         self.steps += 1;
-        if self.steps % self.train_freq != 0 {
+        if !self.steps.is_multiple_of(self.train_freq) {
             return Ok(0.0);
         }
 
@@ -1208,7 +1208,7 @@ impl DqnAgent {
 
         self.optimizer.backward_step(&loss)?;
 
-        if self.steps % self.target_update_freq == 0 {
+        if self.steps.is_multiple_of(self.target_update_freq) {
             self.hard_update_target()?;
         }
 

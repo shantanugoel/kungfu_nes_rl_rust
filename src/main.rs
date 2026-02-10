@@ -420,16 +420,15 @@ impl NesEnv {
             if state.start_timer > 0 {
                 self.countdown_seen = true;
             }
-            if self.debug_state {
-                if last_mode != Some(state.game_mode)
+            if self.debug_state
+                && (last_mode != Some(state.game_mode)
                     || last_phase != Some(self.session_state)
-                    || frames % 120 == 0
+                    || frames.is_multiple_of(120))
                 {
                     self.log_state("sm", &state);
                     last_mode = Some(state.game_mode);
                     last_phase = Some(self.session_state);
                 }
-            }
 
             match self.session_state {
                 SessionState::Startup => {
@@ -1226,7 +1225,7 @@ impl AdamW {
             .get("adamw.step_t")
             .context("Missing adamw.step_t in optimizer state")?
             .to_vec1::<u32>()?;
-        self.step_t = step_t.get(0).copied().unwrap_or(0) as usize;
+        self.step_t = step_t.first().copied().unwrap_or(0) as usize;
         for (i, var) in self.vars.iter().enumerate() {
             let m = tensors
                 .get(&format!("adamw.m.{i}"))
@@ -1332,7 +1331,7 @@ impl DqnAgent {
             return Ok(0.0);
         }
         self.steps += 1;
-        if self.steps % self.train_freq != 0 {
+        if !self.steps.is_multiple_of(self.train_freq) {
             return Ok(0.0);
         }
 
@@ -1375,7 +1374,7 @@ impl DqnAgent {
         self.optimizer.backward_step(&loss)?;
 
         // Periodic hard update target network (much cheaper than per-step soft update)
-        if self.steps % self.target_update_freq == 0 {
+        if self.steps.is_multiple_of(self.target_update_freq) {
             self.hard_update_target()?;
         }
 
@@ -1588,8 +1587,8 @@ fn train(args: &TrainArgs) -> Result<()> {
 
             state = result.state;
 
-            if let Some(win) = window.as_mut() {
-                if total_steps % 4 == 0 {
+            if let Some(win) = window.as_mut()
+                && total_steps.is_multiple_of(4) {
                     if last_title_update.elapsed().as_millis() > 250 {
                         let overlay_ep = if last_render_ep == 0 {
                             episode
@@ -1635,7 +1634,6 @@ fn train(args: &TrainArgs) -> Result<()> {
                     blit_rgba_to_u32(fb, &mut buf);
                     win.update_with_buffer(&buf, 256, 240)?;
                 }
-            }
 
             if result.done || ep_steps > 10_000 {
                 break;
@@ -1671,7 +1669,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         let elapsed = t_start.elapsed().as_secs_f64();
         let fps = total_steps as f64 / elapsed;
 
-        if episode % 10 == 0 || ep_reward > best_reward - 1.0 {
+        if episode.is_multiple_of(10) || ep_reward > best_reward - 1.0 {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
                  Avg100 {avg_reward:>7.1} | Score {score:>6} | Top {top:>6} | Kills {kills:>3} | \
@@ -1877,7 +1875,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
         window.update_with_buffer(&buf, 256, 240)?;
 
         // Print RAM every 30 frames (~0.5 sec)
-        if frame % 30 == 0 {
+        if frame.is_multiple_of(30) {
             println!("\r\n--- Frame {frame} ---");
             println!("\r  Score: {}", env.read_score());
             println!("\r  Timer: {}", env.read_timer());
