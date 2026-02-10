@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
 fn update_pause_from_window(env: &mut NesEnv, window: &minifb::Window) {
@@ -50,6 +50,10 @@ mod ram {
 
     // Score: 6 BCD digits
     pub const SCORE_DIGITS: [u16; 6] = [0x0531, 0x0532, 0x0533, 0x0534, 0x0535, 0x0536];
+
+    // TODO: Discover this for your ROM using explore mode
+    pub const TOP_SCORE_DIGITS: Option<[u16; 6]> =
+        Some([0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0506]);
 
     // Timer: 4 BCD digits
     pub const TIMER_DIGITS: [u16; 4] = [0x0390, 0x0391, 0x0392, 0x0393];
@@ -168,6 +172,7 @@ pub struct GameState {
     pub player_lives: u8,
     pub player_state: u8,
     pub score: u32,
+    pub top_score: u32,
     pub kill_count: u8,
     pub enemy_x: [u8; 4],
     pub enemy_y: [u8; 4],
@@ -231,6 +236,9 @@ pub struct NesEnv {
     sticky_prob: f64,
     last_action: Action,
     paused: bool,
+    clock_enabled: bool,
+    real_time: bool,
+    next_frame_deadline: Option<Instant>,
 }
 
 impl NesEnv {
@@ -248,7 +256,44 @@ impl NesEnv {
             sticky_prob,
             last_action: Action::Noop,
             paused: false,
+            clock_enabled: true,
+            real_time: false,
+            next_frame_deadline: None,
         })
+    }
+
+    pub fn set_clock_enabled(&mut self, enabled: bool) {
+        self.clock_enabled = enabled;
+    }
+
+    pub fn set_real_time(&mut self, enabled: bool) {
+        self.real_time = enabled;
+        self.next_frame_deadline = None;
+    }
+
+    fn clock_frame(&mut self) -> Result<()> {
+        if !self.clock_enabled {
+            return Ok(());
+        }
+        self.deck.clock_frame()?;
+        if self.real_time {
+            self.throttle_frame();
+        }
+        Ok(())
+    }
+
+    fn throttle_frame(&mut self) {
+        let frame_duration = Duration::from_nanos(1_000_000_000 / 60);
+        let now = Instant::now();
+        match self.next_frame_deadline {
+            Some(deadline) if deadline > now => {
+                std::thread::sleep(deadline - now);
+                self.next_frame_deadline = Some(deadline + frame_duration);
+            }
+            _ => {
+                self.next_frame_deadline = Some(now + frame_duration);
+            }
+        }
     }
 
     /// Read a byte from NES CPU address space (0x0000-0x07FF is RAM)
@@ -258,9 +303,13 @@ impl NesEnv {
 
     /// Read BCD score from 6 digit bytes
     fn read_score(&self) -> u32 {
+        self.read_score_digits(&ram::SCORE_DIGITS)
+    }
+
+    fn read_score_digits(&self, digits: &[u16; 6]) -> u32 {
         let mut score = 0u32;
         let multipliers = [100_000, 10_000, 1_000, 100, 10, 1];
-        for (i, &addr) in ram::SCORE_DIGITS.iter().enumerate() {
+        for (i, &addr) in digits.iter().enumerate() {
             let digit = self.peek(addr) & 0x0F; // BCD: mask to low nibble
             score += digit as u32 * multipliers[i];
         }
@@ -287,6 +336,10 @@ impl NesEnv {
         state.player_lives = self.peek(ram::PLAYER_LIVES);
         state.player_state = self.peek(ram::PLAYER_STATE);
         state.score = self.read_score();
+        state.top_score = ram::TOP_SCORE_DIGITS
+            .as_ref()
+            .map(|digits| self.read_score_digits(digits))
+            .unwrap_or(0);
         state.kill_count = self.peek(ram::KILL_COUNTER);
         state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
         state.floor = self.peek(ram::FLOOR);
@@ -337,7 +390,7 @@ impl NesEnv {
         let mut rng = rand::rng();
         let noops = rng.random_range(1..30);
         for _ in 0..noops {
-            self.deck.clock_frame()?;
+            self.clock_frame()?;
         }
 
         // Press Start to begin game
@@ -378,7 +431,7 @@ impl NesEnv {
         btn_state.set(JoypadBtnState::START, true);
         for _ in 0..frames {
             self.set_input_state(btn_state);
-            self.deck.clock_frame()?;
+            self.clock_frame()?;
         }
         self.set_input_state(JoypadBtnState::empty());
         Ok(())
@@ -403,7 +456,7 @@ impl NesEnv {
 
         for _ in 0..self.frame_skip {
             self.set_input(effective_action);
-            self.deck.clock_frame()?;
+            self.clock_frame()?;
 
             let state = self.read_state();
 
@@ -859,6 +912,8 @@ fn train(args: &TrainArgs) -> Result<()> {
         args.frame_skip,
         0.25, // sticky action probability
     )?;
+    env.set_clock_enabled(!args.no_clock);
+    env.set_real_time(args.real_time);
     env.press_start(60)?;
 
     let mut window = if args.render {
@@ -893,6 +948,7 @@ fn train(args: &TrainArgs) -> Result<()> {
     let mut last_render_reward = 0.0f64;
     let mut last_render_avg = 0.0f64;
     let mut last_render_score = 0u32;
+    let mut last_render_top = 0u32;
     let mut last_render_kills = 0u8;
 
     // Episode stats for logging
@@ -967,13 +1023,18 @@ fn train(args: &TrainArgs) -> Result<()> {
                 } else {
                     last_render_score
                 };
+                let overlay_top = if last_render_ep == 0 {
+                    env.prev_state.top_score
+                } else {
+                    last_render_top
+                };
                 let overlay_kills = if last_render_ep == 0 {
                     env.prev_state.kill_count
                 } else {
                     last_render_kills
                 };
                 win.set_title(&format!(
-                    "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Kills {overlay_kills}"
+                    "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Top {overlay_top} | Kills {overlay_kills}"
                 ));
                 let fb = env.frame_buffer();
                 let mut buf = vec![0u32; 256 * 240];
@@ -1022,9 +1083,10 @@ fn train(args: &TrainArgs) -> Result<()> {
         if episode % 10 == 0 || ep_reward > best_reward - 1.0 {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
-                 Avg100 {avg_reward:>7.1} | Score {score:>6} | Kills {kills:>3} | \
+                 Avg100 {avg_reward:>7.1} | Score {score:>6} | Top {top:>6} | Kills {kills:>3} | \
                  ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0}",
                 score = env.prev_state.score,
+                top = env.prev_state.top_score,
                 kills = env.prev_state.kill_count,
                 eps = agent.epsilon,
                 loss = avg_loss,
@@ -1036,6 +1098,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         last_render_reward = ep_reward;
         last_render_avg = avg_reward;
         last_render_score = env.prev_state.score;
+        last_render_top = env.prev_state.top_score;
         last_render_kills = env.prev_state.kill_count;
     }
 
@@ -1059,6 +1122,8 @@ fn play(args: &PlayArgs) -> Result<()> {
     let device = Device::new_metal(0).unwrap_or(Device::Cpu);
 
     let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
+    env.set_clock_enabled(!args.no_clock);
+    env.set_real_time(args.real_time);
     let mut agent = DqnAgent::new(&device)?;
     agent.load(&args.model.to_string_lossy())?;
     agent.epsilon = 0.0; // Greedy during evaluation
@@ -1116,9 +1181,10 @@ fn play(args: &PlayArgs) -> Result<()> {
         }
 
         eprintln!(
-            "Episode {}: reward={total_reward:.1}, steps={steps}, score={}, kills={}",
+            "Episode {}: reward={total_reward:.1}, steps={steps}, score={}, top={}, kills={}",
             ep + 1,
             env.prev_state.score,
+            env.prev_state.top_score,
             env.prev_state.kill_count,
         );
 
@@ -1144,6 +1210,8 @@ fn explore(args: &ExploreArgs) -> Result<()> {
     eprintln!("═══════════════════════════════════════════════════════════");
 
     let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
+    env.set_clock_enabled(!args.no_clock);
+    env.set_real_time(args.real_time);
 
     let mut window = minifb::Window::new(
         "Kung Fu — RAM Explorer",
@@ -1210,7 +1278,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
         }
 
         env.set_input_state(btn_state);
-        env.deck.clock_frame()?;
+        env.clock_frame()?;
         frame += 1;
 
         // Render
@@ -1279,6 +1347,8 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
     eprintln!("Running random agent baseline...");
 
     let mut env = NesEnv::new(args.rom.clone(), 4, 0.0)?;
+    env.set_clock_enabled(!args.no_clock);
+    env.set_real_time(args.real_time);
     let mut rng = rand::rng();
     let mut rewards = Vec::new();
 
@@ -1303,9 +1373,10 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
         }
 
         eprintln!(
-            "Random ep {}: reward={total_reward:.1}, steps={steps}, score={}, kills={}",
+            "Random ep {}: reward={total_reward:.1}, steps={steps}, score={}, top={}, kills={}",
             ep + 1,
             env.prev_state.score,
+            env.prev_state.top_score,
             env.prev_state.kill_count,
         );
         rewards.push(total_reward);
@@ -1329,6 +1400,8 @@ fn manual(args: &ManualArgs) -> Result<()> {
     eprintln!("Space: Pause | Esc: Quit");
 
     let mut env = NesEnv::new(args.rom.clone(), 1, 0.0)?;
+    env.set_clock_enabled(!args.no_clock);
+    env.set_real_time(args.real_time);
     let _ = env.reset()?;
     env.press_start(60)?;
 
@@ -1381,7 +1454,7 @@ fn manual(args: &ManualArgs) -> Result<()> {
 
         if !env.is_paused() {
             env.set_input_state(btn_state);
-            env.deck.clock_frame()?;
+            env.clock_frame()?;
         } else {
             env.step_pause()?;
         }
@@ -1432,6 +1505,10 @@ enum Commands {
 struct ExploreArgs {
     #[arg(long)]
     rom: PathBuf,
+    #[arg(long, default_value_t = false)]
+    no_clock: bool,
+    #[arg(long, default_value_t = false)]
+    real_time: bool,
 }
 
 #[derive(Parser)]
@@ -1444,6 +1521,10 @@ struct TrainArgs {
     frame_skip: u32,
     #[arg(long, default_value_t = false)]
     render: bool,
+    #[arg(long, default_value_t = false)]
+    no_clock: bool,
+    #[arg(long, default_value_t = false)]
+    real_time: bool,
 }
 
 #[derive(Parser)]
@@ -1454,18 +1535,30 @@ struct PlayArgs {
     model: PathBuf,
     #[arg(long, default_value = "5")]
     episodes: usize,
+    #[arg(long, default_value_t = false)]
+    no_clock: bool,
+    #[arg(long, default_value_t = false)]
+    real_time: bool,
 }
 
 #[derive(Parser)]
 struct ManualArgs {
     #[arg(long)]
     rom: PathBuf,
+    #[arg(long, default_value_t = false)]
+    no_clock: bool,
+    #[arg(long, default_value_t = false)]
+    real_time: bool,
 }
 
 #[derive(Parser)]
 struct BaselineArgs {
     #[arg(long)]
     rom: PathBuf,
+    #[arg(long, default_value_t = false)]
+    no_clock: bool,
+    #[arg(long, default_value_t = false)]
+    real_time: bool,
 }
 
 // =============================================================================
