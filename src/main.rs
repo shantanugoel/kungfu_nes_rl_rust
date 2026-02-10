@@ -65,22 +65,14 @@ impl Drop for PauseGuard {
 }
 
 #[derive(Clone, Debug)]
-struct StderrPrefixWriter;
+struct StderrLineWriter;
 
-impl Write for StderrPrefixWriter {
+impl Write for StderrLineWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut stderr = std::io::stderr();
-        let mut start = 0;
-        for (i, &b) in buf.iter().enumerate() {
-            if b == b'\n' {
-                stderr.write_all(b"[tetanes] ")?;
-                stderr.write_all(&buf[start..=i])?;
-                start = i + 1;
-            }
-        }
-        if start < buf.len() {
-            stderr.write_all(b"[tetanes] ")?;
-            stderr.write_all(&buf[start..])?;
+        stderr.write_all(buf)?;
+        if !buf.ends_with(b"\n") {
+            stderr.write_all(b"\n")?;
         }
         Ok(buf.len())
     }
@@ -90,8 +82,8 @@ impl Write for StderrPrefixWriter {
     }
 }
 
-impl<'a> MakeWriter<'a> for StderrPrefixWriter {
-    type Writer = StderrPrefixWriter;
+impl<'a> MakeWriter<'a> for StderrLineWriter {
+    type Writer = StderrLineWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
         Self
@@ -296,7 +288,6 @@ pub const STATE_DIM: usize = 34; // Must match to_features() length
 
 pub struct NesEnv {
     deck: ControlDeck,
-    rom_path: PathBuf,
     prev_state: GameState,
     total_reward: f64,
     steps: u64,
@@ -314,7 +305,6 @@ impl NesEnv {
 
         Ok(Self {
             deck,
-            rom_path,
             prev_state: GameState::default(),
             total_reward: 0.0,
             steps: 0,
@@ -405,15 +395,12 @@ impl NesEnv {
 
     /// Reset the emulator
     pub fn reset(&mut self) -> Result<Vec<f32>> {
-        // Reload ROM for clean state
-        self.deck = ControlDeck::new();
-        self.deck.load_rom_path(&self.rom_path)?;
+        self.deck.reset(ResetKind::Soft);
 
         // Random no-op start for stochasticity
         let mut rng = rand::rng();
         let noops = rng.random_range(1..30);
         for _ in 0..noops {
-            // Press Start to get past title screen, then release
             self.deck.clock_frame()?;
         }
 
@@ -946,6 +933,7 @@ fn train(args: &TrainArgs) -> Result<()> {
             256,
             240,
             minifb::WindowOptions {
+                resize: true,
                 scale: minifb::Scale::X2,
                 ..Default::default()
             },
@@ -965,6 +953,13 @@ fn train(args: &TrainArgs) -> Result<()> {
     let mut episode = 0;
     let mut total_steps: u64 = 0;
     let t_start = Instant::now();
+
+    let mut last_render_ep = 0u64;
+    let mut last_render_steps = 0u64;
+    let mut last_render_reward = 0.0f64;
+    let mut last_render_avg = 0.0f64;
+    let mut last_render_score = 0u32;
+    let mut last_render_kills = 0u8;
 
     // Episode stats for logging
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(100);
@@ -1015,6 +1010,39 @@ fn train(args: &TrainArgs) -> Result<()> {
                     eprintln!("\nRender window closed. Exiting training loop.");
                     return Ok(());
                 }
+                let overlay_ep = if last_render_ep == 0 {
+                    episode
+                } else {
+                    last_render_ep
+                };
+                let overlay_steps = if last_render_steps == 0 {
+                    total_steps
+                } else {
+                    last_render_steps
+                };
+                let overlay_reward = if last_render_ep == 0 {
+                    ep_reward
+                } else {
+                    last_render_reward
+                };
+                let overlay_avg = if last_render_ep == 0 {
+                    0.0
+                } else {
+                    last_render_avg
+                };
+                let overlay_score = if last_render_ep == 0 {
+                    env.prev_state.score
+                } else {
+                    last_render_score
+                };
+                let overlay_kills = if last_render_ep == 0 {
+                    env.prev_state.kill_count
+                } else {
+                    last_render_kills
+                };
+                win.set_title(&format!(
+                    "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Kills {overlay_kills}"
+                ));
                 let fb = env.frame_buffer();
                 let mut buf = vec![0u32; 256 * 240];
                 for (i, pixel) in buf.iter_mut().enumerate() {
@@ -1070,6 +1098,13 @@ fn train(args: &TrainArgs) -> Result<()> {
                 loss = avg_loss,
             );
         }
+
+        last_render_ep = episode;
+        last_render_steps = total_steps;
+        last_render_reward = ep_reward;
+        last_render_avg = avg_reward;
+        last_render_score = env.prev_state.score;
+        last_render_kills = env.prev_state.kill_count;
     }
 
     agent.save("checkpoints/final.safetensors")?;
@@ -1105,6 +1140,7 @@ fn play(args: &PlayArgs) -> Result<()> {
         256,
         240,
         minifb::WindowOptions {
+            resize: true,
             scale: minifb::Scale::X2,
             ..Default::default()
         },
@@ -1190,6 +1226,7 @@ fn explore(args: &ExploreArgs) -> Result<()> {
         256,
         240,
         minifb::WindowOptions {
+            resize: true,
             scale: minifb::Scale::X2,
             ..Default::default()
         },
@@ -1392,6 +1429,7 @@ fn manual(args: &ManualArgs) -> Result<()> {
         256,
         240,
         minifb::WindowOptions {
+            resize: true,
             scale: minifb::Scale::X2,
             ..Default::default()
         },
@@ -1533,7 +1571,7 @@ struct BaselineArgs {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
-        .with_writer(StderrPrefixWriter)
+        .with_writer(StderrLineWriter)
         .init();
 
     let cli = Cli::parse();
