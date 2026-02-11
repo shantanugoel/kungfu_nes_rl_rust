@@ -15,9 +15,9 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -96,22 +96,23 @@ pub enum Action {
     Noop = 0,
     Right = 1,
     Left = 2,
-    Punch = 3,  // B button
-    Kick = 4,   // A button
-    Crouch = 5, // Down
-    Jump = 6,   // Up
-    RightPunch = 7,
-    RightKick = 8,
-    LeftPunch = 9,
-    LeftKick = 10,
-    CrouchPunch = 11,
-    CrouchKick = 12,
-    JumpPunch = 13,
-    JumpKick = 14,
+    // Removing these to reduce action space + avoiding the need to know player facing direction
+    // Punch = 3,  // B button
+    // Kick = 4,   // A button
+    Crouch = 3, // Down
+    Jump = 4,   // Up
+    RightPunch = 5,
+    RightKick = 6,
+    LeftPunch = 7,
+    LeftKick = 8,
+    CrouchPunch = 9,
+    CrouchKick = 10,
+    JumpPunch = 11,
+    JumpKick = 12,
 }
 
 impl Action {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 13;
 
     pub fn from_index(i: usize) -> Self {
         assert!(i < Self::COUNT);
@@ -131,12 +132,12 @@ impl Action {
             Action::Left => {
                 state.set(JoypadBtn::Left.into(), true);
             }
-            Action::Punch => {
-                state.set(JoypadBtn::B.into(), true);
-            } // B = punch
-            Action::Kick => {
-                state.set(JoypadBtn::A.into(), true);
-            } // A = kick
+            // Action::Punch => {
+            //     state.set(JoypadBtn::B.into(), true);
+            // } // B = punch
+            // Action::Kick => {
+            //     state.set(JoypadBtn::A.into(), true);
+            // } // A = kick
             Action::Crouch => {
                 state.set(JoypadBtn::Down.into(), true);
             }
@@ -460,11 +461,11 @@ impl NesEnv {
                 && (last_mode != Some(state.game_mode)
                     || last_phase != Some(self.session_state)
                     || frames.is_multiple_of(120))
-                {
-                    self.log_state("sm", &state);
-                    last_mode = Some(state.game_mode);
-                    last_phase = Some(self.session_state);
-                }
+            {
+                self.log_state("sm", &state);
+                last_mode = Some(state.game_mode);
+                last_phase = Some(self.session_state);
+            }
 
             match self.session_state {
                 SessionState::Startup => {
@@ -829,9 +830,9 @@ impl NesEnv {
             // Check life loss
             if state.player_lives < self.prev_state.player_lives && self.prev_state.player_lives > 0
             {
-                frame_reward -= 10.0; // Death penalty
+                frame_reward -= 100.0; // Death penalty
                 if self.reward_debug {
-                    self.reward_breakdown.death -= 10.0;
+                    self.reward_breakdown.death -= 100.0;
                 }
                 life_lost = true;
                 if state.player_lives == 0 {
@@ -899,7 +900,7 @@ impl NesEnv {
         // 2. Score delta — primary kill/combat signal
         let score_delta = cur.score as i64 - prev.score as i64;
         if score_delta > 0 && score_delta < 5_000 {
-            score_reward += score_delta as f64 / 10.0;
+            score_reward += (score_delta as f64 / 50.0).min(2.0);
         }
 
         // 3. Health delta (penalize damage)
@@ -910,10 +911,12 @@ impl NesEnv {
             }
         }
 
-        // 4. Rightward movement (small)
+        // 4. Leftward movement (small)
+        // May need to add alternating floor, reversing direction reward later.
+        // Also stopping this for boss fight time
         let dx = cur.player_x as i32 - prev.player_x as i32;
-        if dx.abs() < 128 && dx > 0 {
-            movement_reward += dx as f64 * 0.02;
+        if dx.abs() < 128 && dx < 0 {
+            movement_reward += (-dx) as f64 * 0.05;
         }
 
         // 5. Floor completion bonus
@@ -930,12 +933,8 @@ impl NesEnv {
         // 7. Time penalty
         reward += time_penalty;
 
-        reward += energy_reward
-            + score_reward
-            + hp_penalty
-            + movement_reward
-            + floor_bonus
-            + boss_reward;
+        reward +=
+            energy_reward + score_reward + hp_penalty + movement_reward + floor_bonus + boss_reward;
 
         if self.reward_debug {
             self.reward_breakdown.energy += energy_reward;
@@ -1497,14 +1496,16 @@ impl DqnAgent {
             .mean_all()?;
 
         // Backprop with gradient clipping
-        self.optimizer.backward_step(&loss, Some(self.max_grad_norm))?;
+        self.optimizer
+            .backward_step(&loss, Some(self.max_grad_norm))?;
 
         // Soft update target network every gradient step
         self.soft_update_target()?;
 
         // Linear epsilon decay based on total env steps
         let progress = (self.total_env_steps as f64) / (self.epsilon_decay_steps as f64);
-        self.epsilon = self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
+        self.epsilon =
+            self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
 
         // LR decay after lr_decay_start steps
         if self.total_env_steps > self.lr_decay_start {
@@ -1755,52 +1756,53 @@ fn train(args: &TrainArgs) -> Result<()> {
             state = result.state;
 
             if let Some(win) = window.as_mut()
-                && total_steps.is_multiple_of(4) {
-                    if last_title_update.elapsed().as_millis() > 250 {
-                        let overlay_ep = if last_render_ep == 0 {
-                            episode
-                        } else {
-                            last_render_ep
-                        };
-                        let overlay_steps = if last_render_steps == 0 {
-                            total_steps
-                        } else {
-                            last_render_steps
-                        };
-                        let overlay_reward = if last_render_ep == 0 {
-                            ep_reward
-                        } else {
-                            last_render_reward
-                        };
-                        let overlay_avg = if last_render_ep == 0 {
-                            0.0
-                        } else {
-                            last_render_avg
-                        };
-                        let overlay_score = if last_render_ep == 0 {
-                            ep_score
-                        } else {
-                            last_render_score
-                        };
-                        let overlay_top = if last_render_ep == 0 {
-                            all_time_top_score
-                        } else {
-                            last_render_top
-                        };
-                        let overlay_kills = if last_render_ep == 0 {
-                            ep_kills
-                        } else {
-                            last_render_kills
-                        };
-                        win.set_title(&format!(
+                && total_steps.is_multiple_of(4)
+            {
+                if last_title_update.elapsed().as_millis() > 250 {
+                    let overlay_ep = if last_render_ep == 0 {
+                        episode
+                    } else {
+                        last_render_ep
+                    };
+                    let overlay_steps = if last_render_steps == 0 {
+                        total_steps
+                    } else {
+                        last_render_steps
+                    };
+                    let overlay_reward = if last_render_ep == 0 {
+                        ep_reward
+                    } else {
+                        last_render_reward
+                    };
+                    let overlay_avg = if last_render_ep == 0 {
+                        0.0
+                    } else {
+                        last_render_avg
+                    };
+                    let overlay_score = if last_render_ep == 0 {
+                        ep_score
+                    } else {
+                        last_render_score
+                    };
+                    let overlay_top = if last_render_ep == 0 {
+                        all_time_top_score
+                    } else {
+                        last_render_top
+                    };
+                    let overlay_kills = if last_render_ep == 0 {
+                        ep_kills
+                    } else {
+                        last_render_kills
+                    };
+                    win.set_title(&format!(
                             "Kung Fu Master — Training | Ep {overlay_ep} | Steps {overlay_steps} | R {overlay_reward:.1} | Avg100 {overlay_avg:.1} | Score {overlay_score} | Top {overlay_top} | Kills {overlay_kills}"
                         ));
-                        last_title_update = Instant::now();
-                    }
-                    let fb = env.frame_buffer();
-                    blit_rgba_to_u32(fb, &mut buf);
-                    win.update_with_buffer(&buf, 256, 240)?;
+                    last_title_update = Instant::now();
                 }
+                let fb = env.frame_buffer();
+                blit_rgba_to_u32(fb, &mut buf);
+                win.update_with_buffer(&buf, 256, 240)?;
+            }
 
             if result.done || ep_steps > 10_000 {
                 if result.game_over {
