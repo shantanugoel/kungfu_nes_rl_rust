@@ -82,7 +82,7 @@ mod ram {
     // TODO: Discover these for your ROM using explore mode
     // WARNING: 0x0534 collides with SCORE_DIGITS[3] (score_100).
     pub const BOSS_HP: Option<u16> = None; // Unknown in this ROM
-    pub const FLOOR: u16 = 0x0058; // Verify! Try scanning during floor transition
+    pub const FLOOR: u16 = 0x005F; // Confirmed floor/stage counter
 }
 
 // =============================================================================
@@ -209,7 +209,19 @@ pub struct GameState {
     pub knife_active: [bool; 4],
     pub boss_hp: u8,
     pub floor: u8,
-    pub timer: u8,
+    pub timer: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RewardBreakdown {
+    pub score: f64,
+    pub hp: f64,
+    pub energy: f64,
+    pub movement: f64,
+    pub floor: f64,
+    pub boss: f64,
+    pub time: f64,
+    pub death: f64,
 }
 
 impl GameState {
@@ -228,7 +240,7 @@ impl GameState {
         } else {
             self.player_hp as f32
         };
-        f[idx] = hp / 176.0;
+        f[idx] = hp / 48.0;
         idx += 1;
         f[idx] = self.player_lives as f32 / 5.0;
         idx += 1;
@@ -318,7 +330,7 @@ impl GameState {
 
         f[idx] = self.boss_hp as f32 / 255.0;
         idx += 1;
-        f[idx] = self.timer as f32 / 255.0;
+        f[idx] = (self.timer.min(9999) as f32) / 9999.0;
         idx += 1;
         f[idx] = self.kill_count as f32 / 255.0;
 
@@ -355,6 +367,8 @@ pub struct NesEnv {
     session_state: SessionState,
     countdown_seen: bool,
     debug_state: bool,
+    reward_debug: bool,
+    reward_breakdown: RewardBreakdown,
     rng: SmallRng,
 }
 
@@ -375,6 +389,7 @@ impl NesEnv {
             .with_context(|| format!("Failed to load ROM: {}", rom_path.display()))?;
 
         let debug_state = Self::debug_state_enabled();
+        let reward_debug = Self::debug_reward_enabled();
 
         Ok(Self {
             deck,
@@ -391,6 +406,8 @@ impl NesEnv {
             session_state: SessionState::Startup,
             countdown_seen: false,
             debug_state,
+            reward_debug,
+            reward_breakdown: RewardBreakdown::default(),
             rng: SmallRng::from_os_rng(),
         })
     }
@@ -400,6 +417,25 @@ impl NesEnv {
             Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
             Err(_) => false,
         }
+    }
+
+    fn debug_reward_enabled() -> bool {
+        match std::env::var("KFM_DEBUG_REWARD") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    pub fn reward_debug_enabled(&self) -> bool {
+        self.reward_debug
+    }
+
+    pub fn clear_reward_breakdown(&mut self) {
+        self.reward_breakdown = RewardBreakdown::default();
+    }
+
+    pub fn reward_breakdown(&self) -> RewardBreakdown {
+        self.reward_breakdown
     }
 
     fn is_action_mode(mode: u8) -> bool {
@@ -627,7 +663,7 @@ impl NesEnv {
         state.kill_count = self.peek(ram::KILL_COUNTER);
         state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
         state.floor = self.peek(ram::FLOOR);
-        state.timer = (self.read_timer().min(u8::MAX as u16)) as u8;
+        state.timer = self.read_timer();
 
         for i in 0..4 {
             state.enemy_x[i] = self.peek(ram::ENEMY_X[i]);
@@ -793,7 +829,10 @@ impl NesEnv {
             // Check life loss
             if state.player_lives < self.prev_state.player_lives && self.prev_state.player_lives > 0
             {
-                frame_reward -= 25.0; // Death penalty
+                frame_reward -= 10.0; // Death penalty
+                if self.reward_debug {
+                    self.reward_breakdown.death -= 10.0;
+                }
                 life_lost = true;
                 if state.player_lives == 0 {
                     game_over = true;
@@ -828,9 +867,16 @@ impl NesEnv {
         })
     }
 
-    fn compute_reward(&self, cur: &GameState) -> f64 {
+    fn compute_reward(&mut self, cur: &GameState) -> f64 {
         let prev = &self.prev_state;
         let mut reward = 0.0;
+        let mut energy_reward = 0.0;
+        let mut score_reward = 0.0;
+        let mut hp_penalty = 0.0;
+        let mut movement_reward = 0.0;
+        let mut floor_bonus = 0.0;
+        let mut boss_reward = 0.0;
+        let time_penalty = -0.001;
 
         // 1. Partial damage on multi-hit enemies
         // Guard against slot recycling: require same enemy type and reasonable drop
@@ -841,48 +887,65 @@ impl NesEnv {
             {
                 let prev_energy = prev.enemy_energy[i];
                 let cur_energy = cur.enemy_energy[i];
-                let drop = prev_energy.wrapping_sub(cur_energy);
-                if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF && drop <= 4 {
-                    reward += drop as f64 * 2.0;
+                if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF {
+                    let drop = prev_energy - cur_energy;
+                    if drop <= 4 {
+                        energy_reward += drop as f64 * 2.0;
+                    }
                 }
             }
         }
 
         // 2. Score delta — primary kill/combat signal
-        // Divisor 15 balances offense vs defense: a 200-pt kick kill → +13.3
-        // vs a typical 16-HP hit penalty of -8.0 → ~1.66:1 ratio
         let score_delta = cur.score as i64 - prev.score as i64;
         if score_delta > 0 && score_delta < 5_000 {
-            reward += score_delta as f64 / 15.0;
+            score_reward += score_delta as f64 / 10.0;
         }
 
         // 3. Health delta (penalize damage)
         if cur.player_hp != 0xFF && prev.player_hp != 0xFF {
             let hp_delta = cur.player_hp as i32 - prev.player_hp as i32;
             if hp_delta < 0 && hp_delta > -200 {
-                reward += hp_delta as f64 * 0.5;
+                hp_penalty += hp_delta as f64 * 0.25;
             }
         }
 
         // 4. Rightward movement (small)
         let dx = cur.player_x as i32 - prev.player_x as i32;
         if dx.abs() < 128 && dx > 0 {
-            reward += dx as f64 * 0.02;
+            movement_reward += dx as f64 * 0.02;
         }
 
         // 5. Floor completion bonus
         if cur.floor > prev.floor {
-            reward += 100.0;
+            floor_bonus += 100.0;
         }
 
         // 6. Boss damage
         let boss_delta = prev.boss_hp as i32 - cur.boss_hp as i32;
         if boss_delta > 0 && boss_delta < 200 {
-            reward += boss_delta as f64 * 2.0;
+            boss_reward += boss_delta as f64 * 2.0;
         }
 
         // 7. Time penalty
-        reward -= 0.001;
+        reward += time_penalty;
+
+        reward += energy_reward
+            + score_reward
+            + hp_penalty
+            + movement_reward
+            + floor_bonus
+            + boss_reward;
+
+        if self.reward_debug {
+            self.reward_breakdown.energy += energy_reward;
+            self.reward_breakdown.score += score_reward;
+            self.reward_breakdown.hp += hp_penalty;
+            self.reward_breakdown.movement += movement_reward;
+            self.reward_breakdown.floor += floor_bonus;
+            self.reward_breakdown.boss += boss_reward;
+            self.reward_breakdown.time += time_penalty;
+        }
 
         reward
     }
@@ -1639,6 +1702,9 @@ fn train(args: &TrainArgs) -> Result<()> {
         let mut ep_steps = 0u64;
         let mut ep_loss = 0.0f32;
         let mut loss_count = 0u32;
+        if env.reward_debug_enabled() {
+            env.clear_reward_breakdown();
+        }
 
         loop {
             if let Some(win) = window.as_ref() {
@@ -1785,6 +1851,20 @@ fn train(args: &TrainArgs) -> Result<()> {
                 eps = agent.epsilon,
                 loss = avg_loss,
             );
+            if env.reward_debug_enabled() {
+                let breakdown = env.reward_breakdown();
+                eprintln!(
+                    "  R parts | score {:+.1} | hp {:+.1} | death {:+.1} | energy {:+.1} | move {:+.1} | floor {:+.1} | boss {:+.1} | time {:+.1}",
+                    breakdown.score,
+                    breakdown.hp,
+                    breakdown.death,
+                    breakdown.energy,
+                    breakdown.movement,
+                    breakdown.floor,
+                    breakdown.boss,
+                    breakdown.time,
+                );
+            }
         }
 
         last_render_ep = episode;
