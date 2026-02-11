@@ -1108,14 +1108,19 @@ struct DqnAgent {
     device: Device,
     gamma: f64,
     epsilon: f64,
-    epsilon_min: f64,
-    epsilon_decay: f64,
-    tau: f64, // Soft update coefficient
+    epsilon_start: f64,
+    epsilon_end: f64,
+    epsilon_decay_steps: u64, // Linear decay over this many env steps
+    tau: f64,
+    max_grad_norm: f64,
+    initial_lr: f64,
+    lr_decay_start: u64,
+    lr_decay_factor: f64,
     replay: ReplayBuffer,
     batch_size: usize,
-    learn_start: usize,      // Min replay size before training starts
-    train_freq: u64,         // Train every N steps
-    target_update_freq: u64, // Hard-update target every N gradient steps
+    learn_start: usize,
+    train_freq: u64,
+    total_env_steps: u64,
     steps: u64,
     rng: SmallRng,
 }
@@ -1165,9 +1170,56 @@ impl AdamW {
         self.params.lr = lr;
     }
 
-    fn backward_step(&mut self, loss: &Tensor) -> Result<()> {
+    fn backward_step(&mut self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<()> {
         let grads = loss.backward()?;
-        self.step(&grads)
+        if let Some(max_norm) = max_grad_norm {
+            let mut total_norm_sq = 0f64;
+            for var in self.vars.iter() {
+                if let Some(g) = grads.get(&var.var) {
+                    let norm = g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                    total_norm_sq += norm;
+                }
+            }
+            let total_norm = total_norm_sq.sqrt();
+            if total_norm > max_norm {
+                let clip_coef = max_norm / (total_norm + 1e-6);
+                self.step_with_clip(&grads, clip_coef)
+            } else {
+                self.step(&grads)
+            }
+        } else {
+            self.step(&grads)
+        }
+    }
+
+    fn step_with_clip(&mut self, grads: &GradStore, clip_coef: f64) -> Result<()> {
+        self.step_t += 1;
+        let lr = self.params.lr;
+        let lambda = self.params.weight_decay;
+        let lr_lambda = lr * lambda;
+        let beta1 = self.params.beta1;
+        let beta2 = self.params.beta2;
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        for var in self.vars.iter() {
+            let theta = &var.var;
+            let m = &var.first_moment;
+            let v = &var.second_moment;
+            if let Some(g) = grads.get(theta) {
+                let g = (g * clip_coef)?;
+                let next_m = ((m.as_tensor() * beta1)? + (&g * (1.0 - beta1))?)?;
+                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
+                let m_hat = (&next_m * scale_m)?;
+                let v_hat = (&next_v * scale_v)?;
+                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
+                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
+                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
+                m.set(&next_m)?;
+                v.set(&next_v)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
     }
 
     fn step(&mut self, grads: &GradStore) -> Result<()> {
@@ -1251,8 +1303,9 @@ impl DqnAgent {
         let online_net = DqnNet::new(online_vb)?;
         let target_net = DqnNet::new(target_vb)?;
 
+        let initial_lr = 1e-4;
         let opt_params = ParamsAdamW {
-            lr: 2.5e-4,
+            lr: initial_lr,
             weight_decay: 1e-5,
             ..Default::default()
         };
@@ -1268,14 +1321,19 @@ impl DqnAgent {
             device: device.clone(),
             gamma: 0.99,
             epsilon: 1.0,
-            epsilon_min: 0.02,
-            epsilon_decay: 0.99999,
+            epsilon_start: 1.0,
+            epsilon_end: 0.05,
+            epsilon_decay_steps: 2_000_000,
             tau: 0.005,
-            replay: ReplayBuffer::new(100_000),
+            max_grad_norm: 10.0,
+            initial_lr,
+            lr_decay_start: 1_000_000,
+            lr_decay_factor: 0.5,
+            replay: ReplayBuffer::new(500_000),
             batch_size: 64,
             learn_start: 1000,
             train_freq: 4,
-            target_update_freq: 1000,
+            total_env_steps: 0,
             steps: 0,
             rng: SmallRng::from_os_rng(),
         };
@@ -1370,16 +1428,21 @@ impl DqnAgent {
             )?
             .mean_all()?;
 
-        // Backprop
-        self.optimizer.backward_step(&loss)?;
+        // Backprop with gradient clipping
+        self.optimizer.backward_step(&loss, Some(self.max_grad_norm))?;
 
-        // Periodic hard update target network (much cheaper than per-step soft update)
-        if self.steps.is_multiple_of(self.target_update_freq) {
-            self.hard_update_target()?;
+        // Soft update target network every gradient step
+        self.soft_update_target()?;
+
+        // Linear epsilon decay based on total env steps
+        let progress = (self.total_env_steps as f64) / (self.epsilon_decay_steps as f64);
+        self.epsilon = self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
+
+        // LR decay after lr_decay_start steps
+        if self.total_env_steps > self.lr_decay_start {
+            let decayed_lr = self.initial_lr * self.lr_decay_factor;
+            self.optimizer.set_learning_rate(decayed_lr);
         }
-
-        // Decay epsilon
-        self.epsilon = (self.epsilon * self.epsilon_decay).max(self.epsilon_min);
 
         loss.to_scalar::<f32>().map_err(Into::into)
     }
@@ -1509,6 +1572,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         total_steps = meta.total_steps;
         agent.epsilon = meta.epsilon;
         agent.steps = meta.agent_steps;
+        agent.total_env_steps = total_steps;
         agent.replay = replay;
         eprintln!(
             "📦 Resumed from {} (steps={}, episode={}, epsilon={:.4})",
@@ -1574,6 +1638,8 @@ fn train(args: &TrainArgs) -> Result<()> {
                     done: result.done,
                 });
 
+                total_steps += 1;
+                agent.total_env_steps = total_steps;
                 let loss = agent.train_step()?;
                 if loss > 0.0 {
                     ep_loss += loss;
@@ -1582,7 +1648,6 @@ fn train(args: &TrainArgs) -> Result<()> {
 
                 ep_reward += result.reward as f64;
                 ep_steps += 1;
-                total_steps += 1;
             }
 
             state = result.state;
