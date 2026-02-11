@@ -1618,7 +1618,9 @@ fn train(args: &TrainArgs) -> Result<()> {
     let mut state = [0.0f32; STATE_DIM];
     let mut ep_kills: u32;
     let mut prev_kill_count: u8 = 0;
-    let mut game_score: u32 = 0;
+    let mut ep_score: u32;
+    let mut prev_score: u32 = 0;
+    let mut game_total_score: u32 = 0;
 
     while total_steps < args.timesteps {
         episode += 1;
@@ -1626,11 +1628,13 @@ fn train(args: &TrainArgs) -> Result<()> {
         if need_reset {
             state = env.reset()?;
             prev_kill_count = env.prev_state.kill_count;
-            game_score = 0;
+            prev_score = env.prev_state.score;
+            game_total_score = 0;
             need_reset = false;
         }
 
         ep_kills = 0;
+        ep_score = 0;
         let mut ep_reward = 0.0;
         let mut ep_steps = 0u64;
         let mut ep_loss = 0.0f32;
@@ -1675,7 +1679,11 @@ fn train(args: &TrainArgs) -> Result<()> {
                     ep_kills += kill_delta as u32;
                 }
                 prev_kill_count = result.kills;
-                game_score = result.score;
+
+                let score_delta = result.score.saturating_sub(prev_score);
+                ep_score += score_delta;
+                game_total_score += score_delta;
+                prev_score = result.score;
             }
 
             state = result.state;
@@ -1704,7 +1712,7 @@ fn train(args: &TrainArgs) -> Result<()> {
                             last_render_avg
                         };
                         let overlay_score = if last_render_ep == 0 {
-                            game_score
+                            ep_score
                         } else {
                             last_render_score
                         };
@@ -1765,14 +1773,14 @@ fn train(args: &TrainArgs) -> Result<()> {
         let elapsed = t_start.elapsed().as_secs_f64();
         let fps = total_steps as f64 / elapsed;
 
-        if game_score > all_time_top_score {
-            all_time_top_score = game_score;
+        if game_total_score > all_time_top_score {
+            all_time_top_score = game_total_score;
         }
 
         if episode.is_multiple_of(10) || ep_reward > best_reward - 1.0 {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
-                 Avg100 {avg_reward:>7.1} | Score {game_score:>6} | Top {all_time_top_score:>6} | Kills {ep_kills:>3} | \
+                 Avg100 {avg_reward:>7.1} | Score {ep_score:>6} | Top {all_time_top_score:>6} | Kills {ep_kills:>3} | \
                  ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0}",
                 eps = agent.epsilon,
                 loss = avg_loss,
@@ -1783,7 +1791,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         last_render_steps = total_steps;
         last_render_reward = ep_reward;
         last_render_avg = avg_reward;
-        last_render_score = game_score;
+        last_render_score = ep_score;
         last_render_top = all_time_top_score;
         last_render_kills = ep_kills;
     }
