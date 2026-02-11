@@ -12,6 +12,7 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x04A6` | `PLAYER_HP` | 1 | Player health points (see Technical Notes). | 0-48 expected, `0xFF` sentinel during death. |
 | `0x036E` | `PLAYER_POSE` | 1 | Player pose/animation index. | Changes with actions and movement. |
 | `0x036F` | `PLAYER_STATE` | 1 | Player direction and attack state (see Notes). | Low nibble: direction/stance; high nibble: attack type. |
+| `0x0065` | `PAGE` | 1 | Screen/page number for horizontal scroll. | Increments/decrements on screen transitions. |
 | `0x00CE - 0x00D1` | `ENEMY_X` | 4 | X positions for enemy slots 0 through 3. | 0-255 (screen-space). |
 | `0x0087 - 0x008A` | `ENEMY_TYPE` | 4 | Enemy type identifiers for slots 0 through 3. | 0-7 observed (enemy class id). |
 | `0x00B0 - 0x00B3` | `ENEMY_Y` | 4 | Y positions for enemy slots 0 through 3. | 0-255 (screen-space). |

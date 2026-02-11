@@ -30,6 +30,7 @@ mod ram {
     #[allow(dead_code)]
     pub const PLAYER_POSE: u16 = 0x036E;
     pub const PLAYER_STATE: u16 = 0x036F;
+    pub const PAGE: u16 = 0x0065;
     pub const GAME_MODE: u16 = 0x0062;
     pub const START_TIMER: u16 = 0x003A;
     pub const ENEMY_X: [u16; 4] = [0x00CE, 0x00CF, 0x00D0, 0x00D1];
@@ -146,6 +147,7 @@ pub struct GameState {
     pub player_hp: u8,
     pub player_lives: u8,
     pub player_state: u8,
+    pub page: u8,
     pub game_mode: u8,
     pub start_timer: u8,
     pub score: u32,
@@ -288,6 +290,10 @@ impl GameState {
         f[idx] = self.kill_count as f32 / 255.0;
         f
     }
+
+    fn global_x(&self) -> i32 {
+        (self.page as i32) * 256 + self.player_x as i32
+    }
 }
 
 // =============================================================================
@@ -323,6 +329,9 @@ pub struct NesEnv {
     debug_state: bool,
     reward_debug: bool,
     reward_breakdown: RewardBreakdown,
+    progress_floor: u8,
+    progress_start_global_x: i32,
+    progress_best: i32,
     rng: SmallRng,
 }
 
@@ -354,6 +363,9 @@ impl NesEnv {
             debug_state,
             reward_debug,
             reward_breakdown: RewardBreakdown::default(),
+            progress_floor: 0,
+            progress_start_global_x: 0,
+            progress_best: 0,
             rng: SmallRng::from_os_rng(),
         })
     }
@@ -595,6 +607,7 @@ impl NesEnv {
         state.player_hp = self.peek(ram::PLAYER_HP);
         state.player_lives = self.peek(ram::PLAYER_LIVES);
         state.player_state = self.peek(ram::PLAYER_STATE);
+        state.page = self.peek(ram::PAGE);
         state.game_mode = self.peek(ram::GAME_MODE);
         state.start_timer = self.peek(ram::START_TIMER);
         state.score = self.read_score();
@@ -689,6 +702,9 @@ impl NesEnv {
         self.total_reward = 0.0;
         self.steps = 0;
         self.last_action = Action::Noop;
+        self.progress_floor = self.prev_state.floor;
+        self.progress_start_global_x = self.prev_state.global_x();
+        self.progress_best = 0;
         Ok(self.prev_state.to_features())
     }
 
@@ -731,9 +747,24 @@ impl NesEnv {
             }
         }
 
-        let dx = cur.player_x as i32 - prev.player_x as i32;
-        if dx.abs() < 128 && dx < 0 {
-            movement_reward += (-dx) as f64 * 0.05;
+        let cur_global_x = cur.global_x();
+        if cur.floor != self.progress_floor {
+            self.progress_floor = cur.floor;
+            self.progress_start_global_x = cur_global_x;
+            self.progress_best = 0;
+        } else {
+            let progress = if cur.floor % 2 == 0 {
+                self.progress_start_global_x - cur_global_x
+            } else {
+                cur_global_x - self.progress_start_global_x
+            };
+            if progress > self.progress_best {
+                let delta = (progress - self.progress_best).min(128);
+                if delta > 0 {
+                    movement_reward += delta as f64 * 0.05;
+                    self.progress_best = progress;
+                }
+            }
         }
 
         if cur.floor > prev.floor {

@@ -49,6 +49,7 @@ mod ram {
     pub const PLAYER_HP: u16 = 0x04A6;
     pub const PLAYER_POSE: u16 = 0x036E;
     pub const PLAYER_STATE: u16 = 0x036F;
+    pub const PAGE: u16 = 0x0065;
     // 0x00 = title screen, 0x01 = countdown, 0x02 = demo/playing (see START_TIMER)
     pub const GAME_MODE: u16 = 0x0062;
     // Counts down to 0 before player input is accepted
@@ -193,6 +194,7 @@ pub struct GameState {
     pub player_hp: u8,
     pub player_lives: u8,
     pub player_state: u8,
+    pub page: u8,
     pub game_mode: u8,
     pub start_timer: u8,
     pub score: u32,
@@ -337,6 +339,10 @@ impl GameState {
 
         f
     }
+
+    fn global_x(&self) -> i32 {
+        (self.page as i32) * 256 + self.player_x as i32
+    }
 }
 
 pub const STATE_DIM: usize = 49; // Must match to_features() length
@@ -370,6 +376,9 @@ pub struct NesEnv {
     debug_state: bool,
     reward_debug: bool,
     reward_breakdown: RewardBreakdown,
+    progress_floor: u8,
+    progress_start_global_x: i32,
+    progress_best: i32,
     rng: SmallRng,
 }
 
@@ -409,6 +418,9 @@ impl NesEnv {
             debug_state,
             reward_debug,
             reward_breakdown: RewardBreakdown::default(),
+            progress_floor: 0,
+            progress_start_global_x: 0,
+            progress_best: 0,
             rng: SmallRng::from_os_rng(),
         })
     }
@@ -654,6 +666,7 @@ impl NesEnv {
         state.player_hp = self.peek(ram::PLAYER_HP);
         state.player_lives = self.peek(ram::PLAYER_LIVES);
         state.player_state = self.peek(ram::PLAYER_STATE);
+        state.page = self.peek(ram::PAGE);
         state.game_mode = self.peek(ram::GAME_MODE);
         state.start_timer = self.peek(ram::START_TIMER);
         state.score = self.read_score();
@@ -741,6 +754,9 @@ impl NesEnv {
         self.steps = 0;
         self.last_action = Action::Noop;
         self.paused = false;
+        self.progress_floor = self.prev_state.floor;
+        self.progress_start_global_x = self.prev_state.global_x();
+        self.progress_best = 0;
 
         Ok(self.prev_state.to_features())
     }
@@ -911,12 +927,25 @@ impl NesEnv {
             }
         }
 
-        // 4. Leftward movement (small)
-        // May need to add alternating floor, reversing direction reward later.
-        // Also stopping this for boss fight time
-        let dx = cur.player_x as i32 - prev.player_x as i32;
-        if dx.abs() < 128 && dx < 0 {
-            movement_reward += (-dx) as f64 * 0.05;
+        // 4. Directional progress (ratchet)
+        let cur_global_x = cur.global_x();
+        if cur.floor != self.progress_floor {
+            self.progress_floor = cur.floor;
+            self.progress_start_global_x = cur_global_x;
+            self.progress_best = 0;
+        } else {
+            let progress = if cur.floor % 2 == 0 {
+                self.progress_start_global_x - cur_global_x
+            } else {
+                cur_global_x - self.progress_start_global_x
+            };
+            if progress > self.progress_best {
+                let delta = (progress - self.progress_best).min(128);
+                if delta > 0 {
+                    movement_reward += delta as f64 * 0.05;
+                    self.progress_best = progress;
+                }
+            }
         }
 
         // 5. Floor completion bonus
