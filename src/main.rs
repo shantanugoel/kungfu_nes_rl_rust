@@ -740,7 +740,9 @@ impl NesEnv {
         Ok(())
     }
 
-    /// Step the environment: apply action, advance frames, compute reward
+    /// Step the environment: apply action, advance frames, compute reward.
+    /// Returns done=true on any life loss (per-life episodes for training).
+    /// game_over=true when all lives are spent (triggers emulator reset).
     pub fn step(&mut self, action: Action) -> Result<StepResult> {
         self.steps += 1;
 
@@ -754,19 +756,22 @@ impl NesEnv {
 
         // Apply action and advance frame_skip frames
         let mut frame_reward = 0.0;
-        let mut done = false;
+        let mut life_lost = false;
+        let mut game_over = false;
         let mut playing = true;
         if self.session_state != SessionState::Playing {
             let state = self.run_state_machine(180)?;
             self.log_state("step-nonplay", &state);
             playing = false;
-            done = self.session_state != SessionState::Playing;
+            let done = self.session_state != SessionState::Playing;
             self.prev_state = state;
             let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
             return Ok(StepResult {
                 state: self.prev_state.to_features(),
                 reward: 0.0,
                 done,
+                life_lost: false,
+                game_over: false,
                 score: self.prev_state.score,
                 total_reward: self.total_reward,
                 kills: self.prev_state.kill_count,
@@ -785,12 +790,13 @@ impl NesEnv {
             let reward = self.compute_reward(&state);
             frame_reward += reward;
 
-            // Check done: lives depleted (penalize any life loss)
+            // Check life loss
             if state.player_lives < self.prev_state.player_lives && self.prev_state.player_lives > 0
             {
                 frame_reward -= 25.0; // Death penalty
+                life_lost = true;
                 if state.player_lives == 0 {
-                    done = true;
+                    game_over = true;
                     self.session_state = SessionState::WaitForTitle;
                     self.countdown_seen = false;
                 }
@@ -799,10 +805,6 @@ impl NesEnv {
             }
 
             self.prev_state = state;
-
-            if done {
-                break;
-            }
         }
 
         if playing {
@@ -815,7 +817,9 @@ impl NesEnv {
         Ok(StepResult {
             state: self.prev_state.to_features(),
             reward: frame_reward as f32,
-            done,
+            done: life_lost,
+            life_lost,
+            game_over,
             score: self.prev_state.score,
             total_reward: self.total_reward,
             kills: self.prev_state.kill_count,
@@ -828,13 +832,7 @@ impl NesEnv {
         let prev = &self.prev_state;
         let mut reward = 0.0;
 
-        // 1. Kill counter delta — most reliable combat signal
-        let kill_delta = cur.kill_count.wrapping_sub(prev.kill_count);
-        if kill_delta > 0 && kill_delta < 10 {
-            reward += kill_delta as f64 * 5.0;
-        }
-
-        // 1b. Partial damage on multi-hit enemies
+        // 1. Partial damage on multi-hit enemies
         // Guard against slot recycling: require same enemy type and reasonable drop
         for i in 0..4 {
             if prev.enemy_active[i]
@@ -850,10 +848,12 @@ impl NesEnv {
             }
         }
 
-        // 2. Score delta (normalized, tighter sanity check)
+        // 2. Score delta — primary kill/combat signal
+        // Divisor 15 balances offense vs defense: a 200-pt kick kill → +13.3
+        // vs a typical 16-HP hit penalty of -8.0 → ~1.66:1 ratio
         let score_delta = cur.score as i64 - prev.score as i64;
         if score_delta > 0 && score_delta < 5_000 {
-            reward += score_delta as f64 / 100.0;
+            reward += score_delta as f64 / 15.0;
         }
 
         // 3. Health delta (penalize damage)
@@ -897,6 +897,8 @@ pub struct StepResult {
     pub state: [f32; STATE_DIM],
     pub reward: f32,
     pub done: bool,
+    pub life_lost: bool,
+    pub game_over: bool,
     pub score: u32,
     pub total_reward: f64,
     pub kills: u8,
@@ -1595,7 +1597,7 @@ fn train(args: &TrainArgs) -> Result<()> {
     let mut last_render_avg = 0.0f64;
     let mut last_render_score = 0u32;
     let mut last_render_top = 0u32;
-    let mut last_render_kills = 0u8;
+    let mut last_render_kills = 0u32;
 
     // Episode stats for logging
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(100);
@@ -1612,9 +1614,23 @@ fn train(args: &TrainArgs) -> Result<()> {
     let mut buf = vec![0u32; 256 * 240];
     let mut last_title_update = Instant::now();
 
+    let mut need_reset = true;
+    let mut state = [0.0f32; STATE_DIM];
+    let mut ep_kills: u32;
+    let mut prev_kill_count: u8 = 0;
+    let mut game_score: u32 = 0;
+
     while total_steps < args.timesteps {
         episode += 1;
-        let mut state = env.reset()?;
+
+        if need_reset {
+            state = env.reset()?;
+            prev_kill_count = env.prev_state.kill_count;
+            game_score = 0;
+            need_reset = false;
+        }
+
+        ep_kills = 0;
         let mut ep_reward = 0.0;
         let mut ep_steps = 0u64;
         let mut ep_loss = 0.0f32;
@@ -1653,6 +1669,13 @@ fn train(args: &TrainArgs) -> Result<()> {
 
                 ep_reward += result.reward as f64;
                 ep_steps += 1;
+
+                let kill_delta = result.kills.wrapping_sub(prev_kill_count);
+                if kill_delta > 0 && kill_delta < 10 {
+                    ep_kills += kill_delta as u32;
+                }
+                prev_kill_count = result.kills;
+                game_score = result.score;
             }
 
             state = result.state;
@@ -1681,17 +1704,17 @@ fn train(args: &TrainArgs) -> Result<()> {
                             last_render_avg
                         };
                         let overlay_score = if last_render_ep == 0 {
-                            env.prev_state.score
+                            game_score
                         } else {
                             last_render_score
                         };
                         let overlay_top = if last_render_ep == 0 {
-                            env.prev_state.top_score
+                            all_time_top_score
                         } else {
                             last_render_top
                         };
                         let overlay_kills = if last_render_ep == 0 {
-                            env.prev_state.kill_count
+                            ep_kills
                         } else {
                             last_render_kills
                         };
@@ -1706,6 +1729,9 @@ fn train(args: &TrainArgs) -> Result<()> {
                 }
 
             if result.done || ep_steps > 10_000 {
+                if result.game_over {
+                    need_reset = true;
+                }
                 break;
             }
         }
@@ -1739,17 +1765,15 @@ fn train(args: &TrainArgs) -> Result<()> {
         let elapsed = t_start.elapsed().as_secs_f64();
         let fps = total_steps as f64 / elapsed;
 
-        let ep_score = env.prev_state.score;
-        if ep_score > all_time_top_score {
-            all_time_top_score = ep_score;
+        if game_score > all_time_top_score {
+            all_time_top_score = game_score;
         }
 
         if episode.is_multiple_of(10) || ep_reward > best_reward - 1.0 {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
-                 Avg100 {avg_reward:>7.1} | Score {ep_score:>6} | Top {all_time_top_score:>6} | Kills {kills:>3} | \
+                 Avg100 {avg_reward:>7.1} | Score {game_score:>6} | Top {all_time_top_score:>6} | Kills {ep_kills:>3} | \
                  ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0}",
-                kills = env.prev_state.kill_count,
                 eps = agent.epsilon,
                 loss = avg_loss,
             );
@@ -1759,9 +1783,9 @@ fn train(args: &TrainArgs) -> Result<()> {
         last_render_steps = total_steps;
         last_render_reward = ep_reward;
         last_render_avg = avg_reward;
-        last_render_score = ep_score;
+        last_render_score = game_score;
         last_render_top = all_time_top_score;
-        last_render_kills = env.prev_state.kill_count;
+        last_render_kills = ep_kills;
     }
 
     agent.save("checkpoints/final.safetensors")?;
@@ -1834,7 +1858,7 @@ fn play(args: &PlayArgs) -> Result<()> {
             blit_rgba_to_u32(fb, &mut buf);
             window.update_with_buffer(&buf, 256, 240)?;
 
-            if result.done || steps > 20_000 || !window.is_open() {
+            if result.game_over || steps > 20_000 || !window.is_open() {
                 break;
             }
         }
@@ -2021,7 +2045,7 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
             total_reward += result.reward as f64;
             steps += 1;
 
-            if result.done || steps > 10_000 {
+            if result.game_over || steps > 10_000 {
                 break;
             }
         }
