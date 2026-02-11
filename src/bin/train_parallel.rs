@@ -8,12 +8,13 @@ use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
 
@@ -26,6 +27,8 @@ mod ram {
     pub const PLAYER_X: u16 = 0x00D4;
     pub const PLAYER_Y: u16 = 0x00B6;
     pub const PLAYER_HP: u16 = 0x04A6;
+    #[allow(dead_code)]
+    pub const PLAYER_POSE: u16 = 0x036E;
     pub const PLAYER_STATE: u16 = 0x036F;
     pub const GAME_MODE: u16 = 0x0062;
     pub const START_TIMER: u16 = 0x003A;
@@ -44,7 +47,7 @@ mod ram {
         Some([0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0506]);
     pub const TIMER_DIGITS: [u16; 4] = [0x0390, 0x0391, 0x0392, 0x0393];
     pub const BOSS_HP: Option<u16> = None;
-    pub const FLOOR: u16 = 0x0058;
+    pub const FLOOR: u16 = 0x005F;
 }
 
 // =============================================================================
@@ -57,25 +60,24 @@ pub enum Action {
     Noop = 0,
     Right = 1,
     Left = 2,
-    Punch = 3,
-    Kick = 4,
-    Crouch = 5,
-    Jump = 6,
-    RightPunch = 7,
-    RightKick = 8,
-    LeftPunch = 9,
-    LeftKick = 10,
-    CrouchPunch = 11,
-    CrouchKick = 12,
-    JumpPunch = 13,
-    JumpKick = 14,
+    Crouch = 3,
+    Jump = 4,
+    RightPunch = 5,
+    RightKick = 6,
+    LeftPunch = 7,
+    LeftKick = 8,
+    CrouchPunch = 9,
+    CrouchKick = 10,
+    JumpPunch = 11,
+    JumpKick = 12,
 }
 
 impl Action {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 13;
 
     pub fn from_index(i: usize) -> Self {
         assert!(i < Self::COUNT);
+        // SAFETY: repr(u8) and bounds checked.
         unsafe { std::mem::transmute(i as u8) }
     }
 
@@ -89,12 +91,6 @@ impl Action {
             }
             Action::Left => {
                 state.set(JoypadBtn::Left.into(), true);
-            }
-            Action::Punch => {
-                state.set(JoypadBtn::B.into(), true);
-            }
-            Action::Kick => {
-                state.set(JoypadBtn::A.into(), true);
             }
             Action::Crouch => {
                 state.set(JoypadBtn::Down.into(), true);
@@ -167,7 +163,19 @@ pub struct GameState {
     pub knife_active: [bool; 4],
     pub boss_hp: u8,
     pub floor: u8,
-    pub timer: u8,
+    pub timer: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RewardBreakdown {
+    pub score: f64,
+    pub hp: f64,
+    pub energy: f64,
+    pub movement: f64,
+    pub floor: f64,
+    pub boss: f64,
+    pub time: f64,
+    pub death: f64,
 }
 
 pub const STATE_DIM: usize = 49;
@@ -186,7 +194,7 @@ impl GameState {
         } else {
             self.player_hp as f32
         };
-        f[idx] = hp / 176.0;
+        f[idx] = hp / 48.0;
         idx += 1;
         f[idx] = self.player_lives as f32 / 5.0;
         idx += 1;
@@ -275,7 +283,7 @@ impl GameState {
 
         f[idx] = self.boss_hp as f32 / 255.0;
         idx += 1;
-        f[idx] = self.timer as f32 / 255.0;
+        f[idx] = (self.timer.min(9999) as f32) / 9999.0;
         idx += 1;
         f[idx] = self.kill_count as f32 / 255.0;
         f
@@ -307,8 +315,14 @@ pub struct NesEnv {
     frame_skip: u32,
     sticky_prob: f64,
     last_action: Action,
+    clock_enabled: bool,
+    real_time: bool,
+    next_frame_deadline: Option<Instant>,
     session_state: SessionState,
     countdown_seen: bool,
+    debug_state: bool,
+    reward_debug: bool,
+    reward_breakdown: RewardBreakdown,
     rng: SmallRng,
 }
 
@@ -321,6 +335,9 @@ impl NesEnv {
         deck.load_rom_path(&rom_path)
             .with_context(|| format!("Failed to load ROM: {}", rom_path.display()))?;
 
+        let debug_state = Self::debug_state_enabled();
+        let reward_debug = Self::debug_reward_enabled();
+
         Ok(Self {
             deck,
             prev_state: GameState::default(),
@@ -329,161 +346,96 @@ impl NesEnv {
             frame_skip,
             sticky_prob,
             last_action: Action::Noop,
+            clock_enabled: true,
+            real_time: false,
+            next_frame_deadline: None,
             session_state: SessionState::Startup,
             countdown_seen: false,
+            debug_state,
+            reward_debug,
+            reward_breakdown: RewardBreakdown::default(),
             rng: SmallRng::from_os_rng(),
         })
+    }
+
+    fn debug_state_enabled() -> bool {
+        match std::env::var("KFM_DEBUG_STATE") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    fn debug_reward_enabled() -> bool {
+        match std::env::var("KFM_DEBUG_REWARD") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    pub fn reward_debug_enabled(&self) -> bool {
+        self.reward_debug
+    }
+
+    pub fn clear_reward_breakdown(&mut self) {
+        self.reward_breakdown = RewardBreakdown::default();
+    }
+
+    pub fn reward_breakdown(&self) -> RewardBreakdown {
+        self.reward_breakdown
     }
 
     fn is_action_mode(mode: u8) -> bool {
         mode == GAME_MODE_ACTION || mode == GAME_MODE_COUNTDOWN
     }
 
-    fn clock_frame(&mut self) -> Result<()> {
-        self.deck.clock_frame()?;
-        Ok(())
+    fn log_state(&self, tag: &str, state: &GameState) {
+        if !self.debug_state {
+            return;
+        }
+        eprintln!(
+            "[state:{tag}] phase={phase:?} mode=0x{mode:02X} start_timer={start_timer} lives={lives} hp={hp} score={score} timer={timer} floor={floor}",
+            phase = self.session_state,
+            mode = state.game_mode,
+            start_timer = state.start_timer,
+            lives = state.player_lives,
+            hp = state.player_hp,
+            score = state.score,
+            timer = state.timer,
+            floor = state.floor,
+        );
     }
 
-    fn peek(&self, addr: u16) -> u8 {
-        self.deck.bus().peek(addr)
+    pub fn set_clock_enabled(&mut self, enabled: bool) {
+        self.clock_enabled = enabled;
     }
 
-    fn read_score(&self) -> u32 {
-        let mut score = 0u32;
-        let multipliers = [100_000, 10_000, 1_000, 100, 10, 1];
-        for (i, &addr) in ram::SCORE_DIGITS.iter().enumerate() {
-            score += (self.peek(addr) & 0x0F) as u32 * multipliers[i];
-        }
-        score
-    }
-
-    fn read_timer(&self) -> u16 {
-        let mut timer = 0u16;
-        let multipliers = [1000, 100, 10, 1];
-        for (i, &addr) in ram::TIMER_DIGITS.iter().enumerate() {
-            timer += (self.peek(addr) & 0x0F) as u16 * multipliers[i];
-        }
-        timer
-    }
-
-    fn read_state(&self) -> GameState {
-        let mut state = GameState::default();
-        state.player_x = self.peek(ram::PLAYER_X);
-        state.player_y = self.peek(ram::PLAYER_Y);
-        state.player_hp = self.peek(ram::PLAYER_HP);
-        state.player_lives = self.peek(ram::PLAYER_LIVES);
-        state.player_state = self.peek(ram::PLAYER_STATE);
-        state.game_mode = self.peek(ram::GAME_MODE);
-        state.start_timer = self.peek(ram::START_TIMER);
-        state.score = self.read_score();
-        state.top_score = ram::TOP_SCORE_DIGITS
-            .as_ref()
-            .map(|digits| {
-                let mut s = 0u32;
-                let m = [100_000, 10_000, 1_000, 100, 10, 1];
-                for (i, &addr) in digits.iter().enumerate() {
-                    s += (self.peek(addr) & 0x0F) as u32 * m[i];
-                }
-                s
-            })
-            .unwrap_or(0);
-        state.kill_count = self.peek(ram::KILL_COUNTER);
-        state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
-        state.floor = self.peek(ram::FLOOR);
-        state.timer = (self.read_timer().min(u8::MAX as u16)) as u8;
-
-        for i in 0..4 {
-            state.enemy_x[i] = self.peek(ram::ENEMY_X[i]);
-            state.enemy_y[i] = self.peek(ram::ENEMY_Y[i]);
-            state.enemy_type[i] = self.peek(ram::ENEMY_TYPE[i]);
-            state.enemy_facing[i] = self.peek(ram::ENEMY_FACING[i]);
-            let pose = self.peek(ram::ENEMY_POSE[i]);
-            state.enemy_active[i] = pose != 0 && pose != 0x7F;
-            state.enemy_energy[i] = self.peek(ram::ENEMY_ENERGY[i]);
-
-            state.knife_x[i] = self.peek(ram::KNIFE_X[i]);
-            state.knife_y[i] = self.peek(ram::KNIFE_Y[i]);
-            let knife_state = self.peek(ram::KNIFE_STATE[i]);
-            state.knife_active[i] = knife_state != 0;
-            state.knife_facing[i] = match knife_state {
-                0x11 => 1,
-                0x01 => 0,
-                _ => 0,
-            };
-        }
-        state
-    }
-
-    fn set_input(&mut self, action: Action) {
-        use tetanes_core::input::JoypadBtnState;
-        let btn_state = action.to_joypad();
-        let joypad = self.deck.joypad_mut(Player::One);
-        for button in [
-            JoypadBtnState::LEFT,
-            JoypadBtnState::RIGHT,
-            JoypadBtnState::UP,
-            JoypadBtnState::DOWN,
-            JoypadBtnState::A,
-            JoypadBtnState::B,
-            JoypadBtnState::TURBO_A,
-            JoypadBtnState::TURBO_B,
-            JoypadBtnState::START,
-            JoypadBtnState::SELECT,
-        ] {
-            joypad.set_button(button, btn_state.contains(button));
-        }
-    }
-
-    fn press_start(&mut self, frames: u32) -> Result<()> {
-        use tetanes_core::input::JoypadBtnState;
-        let mut btn_state = JoypadBtnState::empty();
-        btn_state.set(JoypadBtnState::START, true);
-        let joypad = self.deck.joypad_mut(Player::One);
-        for button in [
-            JoypadBtnState::LEFT,
-            JoypadBtnState::RIGHT,
-            JoypadBtnState::UP,
-            JoypadBtnState::DOWN,
-            JoypadBtnState::A,
-            JoypadBtnState::B,
-            JoypadBtnState::TURBO_A,
-            JoypadBtnState::TURBO_B,
-            JoypadBtnState::START,
-            JoypadBtnState::SELECT,
-        ] {
-            joypad.set_button(button, btn_state.contains(button));
-        }
-        for _ in 0..frames {
-            self.clock_frame()?;
-        }
-        let joypad = self.deck.joypad_mut(Player::One);
-        for button in [
-            JoypadBtnState::LEFT,
-            JoypadBtnState::RIGHT,
-            JoypadBtnState::UP,
-            JoypadBtnState::DOWN,
-            JoypadBtnState::A,
-            JoypadBtnState::B,
-            JoypadBtnState::TURBO_A,
-            JoypadBtnState::TURBO_B,
-            JoypadBtnState::START,
-            JoypadBtnState::SELECT,
-        ] {
-            joypad.set_button(button, false);
-        }
-        Ok(())
+    pub fn set_real_time(&mut self, enabled: bool) {
+        self.real_time = enabled;
+        self.next_frame_deadline = None;
     }
 
     fn run_state_machine(&mut self, max_frames: u32) -> Result<GameState> {
         const START_PRESS_FRAMES: u32 = 2;
         const START_PRESS_INTERVAL: u32 = 30;
+
         let mut frames = 0u32;
         let mut since_press = START_PRESS_INTERVAL;
+        let mut last_mode: Option<u8> = None;
+        let mut last_phase: Option<SessionState> = None;
 
         loop {
             let state = self.read_state();
             if state.start_timer > 0 {
                 self.countdown_seen = true;
+            }
+            if self.debug_state
+                && (last_mode != Some(state.game_mode)
+                    || last_phase != Some(self.session_state)
+                    || frames.is_multiple_of(120))
+            {
+                self.log_state("sm", &state);
+                last_mode = Some(state.game_mode);
+                last_phase = Some(self.session_state);
             }
 
             match self.session_state {
@@ -521,6 +473,9 @@ impl NesEnv {
                 SessionState::WaitForMode2 => {
                     if state.game_mode == GAME_MODE_TITLE {
                         if since_press >= START_PRESS_INTERVAL {
+                            if self.debug_state {
+                                eprintln!("[state:sm] press start");
+                            }
                             self.press_start(START_PRESS_FRAMES)?;
                             frames = frames.saturating_add(START_PRESS_FRAMES);
                             since_press = 0;
@@ -536,6 +491,9 @@ impl NesEnv {
                             if self.countdown_seen {
                                 self.session_state = SessionState::Playing;
                                 return Ok(state);
+                            }
+                            if self.debug_state {
+                                eprintln!("[state:sm] demo detected, press start");
                             }
                             self.press_start(START_PRESS_FRAMES)?;
                             frames = frames.saturating_add(START_PRESS_FRAMES);
@@ -577,6 +535,136 @@ impl NesEnv {
         }
     }
 
+    fn clock_frame(&mut self) -> Result<()> {
+        if !self.clock_enabled {
+            return Ok(());
+        }
+        self.deck.clock_frame()?;
+        if self.real_time {
+            self.throttle_frame();
+        }
+        Ok(())
+    }
+
+    fn throttle_frame(&mut self) {
+        let frame_duration = Duration::from_nanos(1_000_000_000 / 60);
+        let now = Instant::now();
+        match self.next_frame_deadline {
+            Some(deadline) if deadline > now => {
+                std::thread::sleep(deadline - now);
+                self.next_frame_deadline = Some(deadline + frame_duration);
+            }
+            _ => {
+                self.next_frame_deadline = Some(now + frame_duration);
+            }
+        }
+    }
+
+    fn peek(&self, addr: u16) -> u8 {
+        self.deck.bus().peek(addr)
+    }
+
+    fn read_score(&self) -> u32 {
+        self.read_score_digits(&ram::SCORE_DIGITS)
+    }
+
+    fn read_score_digits(&self, digits: &[u16; 6]) -> u32 {
+        let mut score = 0u32;
+        let multipliers = [100_000, 10_000, 1_000, 100, 10, 1];
+        for (i, &addr) in digits.iter().enumerate() {
+            let digit = self.peek(addr) & 0x0F;
+            score += digit as u32 * multipliers[i];
+        }
+        score
+    }
+
+    fn read_timer(&self) -> u16 {
+        let mut timer = 0u16;
+        let multipliers = [1000, 100, 10, 1];
+        for (i, &addr) in ram::TIMER_DIGITS.iter().enumerate() {
+            let digit = self.peek(addr) & 0x0F;
+            timer += digit as u16 * multipliers[i];
+        }
+        timer
+    }
+
+    fn read_state(&self) -> GameState {
+        let mut state = GameState::default();
+        state.player_x = self.peek(ram::PLAYER_X);
+        state.player_y = self.peek(ram::PLAYER_Y);
+        state.player_hp = self.peek(ram::PLAYER_HP);
+        state.player_lives = self.peek(ram::PLAYER_LIVES);
+        state.player_state = self.peek(ram::PLAYER_STATE);
+        state.game_mode = self.peek(ram::GAME_MODE);
+        state.start_timer = self.peek(ram::START_TIMER);
+        state.score = self.read_score();
+        state.top_score = ram::TOP_SCORE_DIGITS
+            .as_ref()
+            .map(|digits| self.read_score_digits(digits))
+            .unwrap_or(0);
+        state.kill_count = self.peek(ram::KILL_COUNTER);
+        state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
+        state.floor = self.peek(ram::FLOOR);
+        state.timer = self.read_timer();
+
+        for i in 0..4 {
+            state.enemy_x[i] = self.peek(ram::ENEMY_X[i]);
+            state.enemy_y[i] = self.peek(ram::ENEMY_Y[i]);
+            state.enemy_type[i] = self.peek(ram::ENEMY_TYPE[i]);
+            state.enemy_facing[i] = self.peek(ram::ENEMY_FACING[i]);
+            let pose = self.peek(ram::ENEMY_POSE[i]);
+            state.enemy_active[i] = pose != 0 && pose != 0x7F;
+            state.enemy_energy[i] = self.peek(ram::ENEMY_ENERGY[i]);
+
+            state.knife_x[i] = self.peek(ram::KNIFE_X[i]);
+            state.knife_y[i] = self.peek(ram::KNIFE_Y[i]);
+            let knife_state = self.peek(ram::KNIFE_STATE[i]);
+            state.knife_active[i] = knife_state != 0;
+            state.knife_facing[i] = match knife_state {
+                0x11 => 1,
+                0x01 => 0,
+                _ => 0,
+            };
+        }
+        state
+    }
+
+    fn set_input(&mut self, action: Action) {
+        let btn_state = action.to_joypad();
+        self.set_input_state(btn_state);
+    }
+
+    fn set_input_state(&mut self, btn_state: tetanes_core::input::JoypadBtnState) {
+        use tetanes_core::input::JoypadBtnState;
+        let joypad = self.deck.joypad_mut(Player::One);
+        for button in [
+            JoypadBtnState::LEFT,
+            JoypadBtnState::RIGHT,
+            JoypadBtnState::UP,
+            JoypadBtnState::DOWN,
+            JoypadBtnState::A,
+            JoypadBtnState::B,
+            JoypadBtnState::TURBO_A,
+            JoypadBtnState::TURBO_B,
+            JoypadBtnState::START,
+            JoypadBtnState::SELECT,
+        ] {
+            joypad.set_button(button, btn_state.contains(button));
+        }
+    }
+
+    fn press_start(&mut self, frames: u32) -> Result<()> {
+        use tetanes_core::input::JoypadBtnState;
+        let mut btn_state = JoypadBtnState::empty();
+        btn_state.set(JoypadBtnState::START, true);
+        for _ in 0..frames {
+            self.set_input_state(btn_state);
+            self.clock_frame()?;
+        }
+        self.set_input_state(JoypadBtnState::empty());
+        Ok(())
+    }
+
     pub fn reset(&mut self) -> Result<[f32; STATE_DIM]> {
         self.deck.reset(ResetKind::Soft);
         self.session_state = SessionState::Startup;
@@ -588,11 +676,13 @@ impl NesEnv {
         }
 
         let state = self.run_state_machine(600)?;
+        self.log_state("reset", &state);
         if self.session_state != SessionState::Playing {
             return Err(anyhow::anyhow!(
-                "Timed out waiting for play state (phase: {:?}, mode: 0x{:02X})",
-                self.session_state,
-                state.game_mode,
+                "Timed out waiting for play state (phase: {phase:?}, mode: 0x{mode:02X}, start_timer: {timer})",
+                phase = self.session_state,
+                mode = state.game_mode,
+                timer = state.start_timer
             ));
         }
         self.prev_state = state;
@@ -602,52 +692,74 @@ impl NesEnv {
         Ok(self.prev_state.to_features())
     }
 
-    fn compute_reward(&self, cur: &GameState) -> f64 {
+    fn compute_reward(&mut self, cur: &GameState) -> f64 {
         let prev = &self.prev_state;
         let mut reward = 0.0;
-
-        let kill_delta = cur.kill_count.wrapping_sub(prev.kill_count);
-        if kill_delta > 0 && kill_delta < 10 {
-            reward += kill_delta as f64 * 5.0;
-        }
+        let mut energy_reward = 0.0;
+        let mut score_reward = 0.0;
+        let mut hp_penalty = 0.0;
+        let mut movement_reward = 0.0;
+        let mut floor_bonus = 0.0;
+        let mut boss_reward = 0.0;
+        let time_penalty = -0.001;
 
         for i in 0..4 {
-            if prev.enemy_active[i] && cur.enemy_active[i] {
+            if prev.enemy_active[i]
+                && cur.enemy_active[i]
+                && prev.enemy_type[i] == cur.enemy_type[i]
+            {
                 let prev_energy = prev.enemy_energy[i];
                 let cur_energy = cur.enemy_energy[i];
                 if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF {
-                    reward += (prev_energy - cur_energy) as f64 * 2.0;
+                    let drop = prev_energy - cur_energy;
+                    if drop <= 4 {
+                        energy_reward += drop as f64 * 2.0;
+                    }
                 }
             }
         }
 
         let score_delta = cur.score as i64 - prev.score as i64;
-        if score_delta > 0 && score_delta < 50_000 {
-            reward += score_delta as f64 / 100.0;
+        if score_delta > 0 && score_delta < 5_000 {
+            score_reward += (score_delta as f64 / 50.0).min(2.0);
         }
 
         if cur.player_hp != 0xFF && prev.player_hp != 0xFF {
             let hp_delta = cur.player_hp as i32 - prev.player_hp as i32;
             if hp_delta < 0 && hp_delta > -200 {
-                reward += hp_delta as f64 * 0.5;
+                hp_penalty += hp_delta as f64 * 0.25;
             }
         }
 
         let dx = cur.player_x as i32 - prev.player_x as i32;
-        if dx.abs() < 128 && dx > 0 {
-            reward += dx as f64 * 0.02;
+        if dx.abs() < 128 && dx < 0 {
+            movement_reward += (-dx) as f64 * 0.05;
         }
 
         if cur.floor > prev.floor {
-            reward += 100.0;
+            floor_bonus += 100.0;
         }
 
         let boss_delta = prev.boss_hp as i32 - cur.boss_hp as i32;
         if boss_delta > 0 && boss_delta < 200 {
-            reward += boss_delta as f64 * 2.0;
+            boss_reward += boss_delta as f64 * 2.0;
         }
 
-        reward -= 0.001;
+        reward += time_penalty;
+
+        reward +=
+            energy_reward + score_reward + hp_penalty + movement_reward + floor_bonus + boss_reward;
+
+        if self.reward_debug {
+            self.reward_breakdown.energy += energy_reward;
+            self.reward_breakdown.score += score_reward;
+            self.reward_breakdown.hp += hp_penalty;
+            self.reward_breakdown.movement += movement_reward;
+            self.reward_breakdown.floor += floor_bonus;
+            self.reward_breakdown.boss += boss_reward;
+            self.reward_breakdown.time += time_penalty;
+        }
+
         reward
     }
 
@@ -662,20 +774,27 @@ impl NesEnv {
         self.last_action = effective_action;
 
         let mut frame_reward = 0.0;
-        let mut done = false;
+        let mut life_lost = false;
+        let mut game_over = false;
         let mut playing = true;
 
         if self.session_state != SessionState::Playing {
             let state = self.run_state_machine(180)?;
+            self.log_state("step-nonplay", &state);
             playing = false;
-            done = self.session_state != SessionState::Playing;
+            let done = self.session_state != SessionState::Playing;
             self.prev_state = state;
+            let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
             return Ok(StepResult {
                 state: self.prev_state.to_features(),
                 reward: 0.0,
                 done,
+                life_lost: false,
+                game_over: false,
                 score: self.prev_state.score,
+                total_reward: self.total_reward,
                 kills: self.prev_state.kill_count,
+                active_enemies,
                 playing,
             });
         }
@@ -690,30 +809,39 @@ impl NesEnv {
 
             if state.player_lives < self.prev_state.player_lives && self.prev_state.player_lives > 0
             {
-                frame_reward -= 25.0;
+                frame_reward -= 100.0;
+                if self.reward_debug {
+                    self.reward_breakdown.death -= 100.0;
+                }
+                life_lost = true;
                 if state.player_lives == 0 {
-                    done = true;
+                    game_over = true;
                     self.session_state = SessionState::WaitForTitle;
                     self.countdown_seen = false;
                 }
+                self.prev_state = state;
+                break;
             }
 
             self.prev_state = state;
-            if done {
-                break;
-            }
         }
 
         if playing {
             self.total_reward += frame_reward;
         }
 
+        let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
+
         Ok(StepResult {
             state: self.prev_state.to_features(),
             reward: frame_reward as f32,
-            done,
+            done: life_lost,
+            life_lost,
+            game_over,
             score: self.prev_state.score,
+            total_reward: self.total_reward,
             kills: self.prev_state.kill_count,
+            active_enemies,
             playing,
         })
     }
@@ -723,8 +851,12 @@ pub struct StepResult {
     pub state: [f32; STATE_DIM],
     pub reward: f32,
     pub done: bool,
+    pub life_lost: bool,
+    pub game_over: bool,
     pub score: u32,
+    pub total_reward: f64,
     pub kills: u8,
+    pub active_enemies: u8,
     pub playing: bool,
 }
 
@@ -776,15 +908,18 @@ impl DqnNet {
 // Replay Buffer & Transition
 // =============================================================================
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Transition {
+    #[serde(with = "serde_big_array::BigArray")]
     state: [f32; STATE_DIM],
     action: usize,
     reward: f32,
+    #[serde(with = "serde_big_array::BigArray")]
     next_state: [f32; STATE_DIM],
     done: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ReplayBuffer {
     buffer: VecDeque<Transition>,
     capacity: usize,
@@ -807,6 +942,20 @@ impl ReplayBuffer {
 
     fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let file = File::create(path.as_ref())?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, self)?;
+        Ok(())
+    }
+
+    fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let reader = std::io::BufReader::new(file);
+        let replay = bincode::deserialize_from(reader)?;
+        Ok(replay)
     }
 
     fn sample(&self, batch_size: usize, dev: &Device, rng: &mut SmallRng) -> Result<BatchTensors> {
@@ -845,6 +994,54 @@ struct BatchTensors {
     rewards: Tensor,
     next_states: Tensor,
     not_dones: Tensor,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TrainMeta {
+    best_reward: f64,
+    episode: u64,
+    total_steps: u64,
+    epsilon: f64,
+    agent_steps: u64,
+}
+
+fn save_checkpoint(
+    agent: &DqnAgent,
+    best_reward: f64,
+    episode: u64,
+    total_steps: u64,
+    dir: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    agent
+        .online_varmap
+        .save(Path::new(dir).join("model.safetensors"))?;
+    agent
+        .target_varmap
+        .save(Path::new(dir).join("target.safetensors"))?;
+    agent.save_optimizer(Path::new(dir).join("optimizer.safetensors"))?;
+    agent.replay.save(Path::new(dir).join("replay.bin"))?;
+
+    let meta = TrainMeta {
+        best_reward,
+        episode,
+        total_steps,
+        epsilon: agent.epsilon,
+        agent_steps: agent.steps,
+    };
+    let file = File::create(Path::new(dir).join("meta.json"))?;
+    let writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(writer, &meta)?;
+    Ok(())
+}
+
+fn save_recent_rewards(recent_rewards: &VecDeque<f64>, dir: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let rewards: Vec<f64> = recent_rewards.iter().copied().collect();
+    let file = File::create(Path::new(dir).join("recent_rewards.json"))?;
+    let writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(writer, &rewards)?;
+    Ok(())
 }
 
 // =============================================================================
@@ -888,9 +1085,60 @@ impl AdamW {
         })
     }
 
-    fn backward_step(&mut self, loss: &Tensor) -> Result<()> {
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.params.lr = lr;
+    }
+
+    fn backward_step(&mut self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<()> {
         let grads = loss.backward()?;
-        self.step(&grads)
+        if let Some(max_norm) = max_grad_norm {
+            let mut total_norm_sq = 0f64;
+            for var in self.vars.iter() {
+                if let Some(g) = grads.get(&var.var) {
+                    let norm = g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                    total_norm_sq += norm;
+                }
+            }
+            let total_norm = total_norm_sq.sqrt();
+            if total_norm > max_norm {
+                let clip_coef = max_norm / (total_norm + 1e-6);
+                self.step_with_clip(&grads, clip_coef)
+            } else {
+                self.step(&grads)
+            }
+        } else {
+            self.step(&grads)
+        }
+    }
+
+    fn step_with_clip(&mut self, grads: &GradStore, clip_coef: f64) -> Result<()> {
+        self.step_t += 1;
+        let lr = self.params.lr;
+        let lambda = self.params.weight_decay;
+        let lr_lambda = lr * lambda;
+        let beta1 = self.params.beta1;
+        let beta2 = self.params.beta2;
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        for var in self.vars.iter() {
+            let theta = &var.var;
+            let m = &var.first_moment;
+            let v = &var.second_moment;
+            if let Some(g) = grads.get(theta) {
+                let g = (g * clip_coef)?;
+                let next_m = ((m.as_tensor() * beta1)? + (&g * (1.0 - beta1))?)?;
+                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
+                let m_hat = (&next_m * scale_m)?;
+                let v_hat = (&next_v * scale_v)?;
+                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
+                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
+                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
+                m.set(&next_m)?;
+                v.set(&next_v)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
     }
 
     fn step(&mut self, grads: &GradStore) -> Result<()> {
@@ -918,6 +1166,46 @@ impl AdamW {
                 v.set(&next_v)?;
                 theta.set(&next_theta)?;
             }
+        }
+        Ok(())
+    }
+
+    fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            "adamw.step_t".to_string(),
+            Tensor::from_slice(&[self.step_t as u32], 1, &Device::Cpu)?,
+        );
+        for (i, var) in self.vars.iter().enumerate() {
+            tensors.insert(
+                format!("adamw.m.{i}"),
+                var.first_moment.as_tensor().detach(),
+            );
+            tensors.insert(
+                format!("adamw.v.{i}"),
+                var.second_moment.as_tensor().detach(),
+            );
+        }
+        candle_core::safetensors::save(&tensors, path.as_ref())?;
+        Ok(())
+    }
+
+    fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let tensors = candle_core::safetensors::load(path.as_ref(), &Device::Cpu)?;
+        let step_t = tensors
+            .get("adamw.step_t")
+            .context("Missing adamw.step_t in optimizer state")?
+            .to_vec1::<u32>()?;
+        self.step_t = step_t.first().copied().unwrap_or(0) as usize;
+        for (i, var) in self.vars.iter().enumerate() {
+            let m = tensors
+                .get(&format!("adamw.m.{i}"))
+                .context("Missing adamw.m tensor in optimizer state")?;
+            let v = tensors
+                .get(&format!("adamw.v.{i}"))
+                .context("Missing adamw.v tensor in optimizer state")?;
+            var.first_moment.set(m)?;
+            var.second_moment.set(v)?;
         }
         Ok(())
     }
@@ -1033,12 +1321,17 @@ fn worker_loop(
 
     let mut episodes = 0u64;
     let mut worker_steps = 0u64;
+    let mut need_reset = true;
+    let mut state = [0.0f32; STATE_DIM];
 
     while !stop.load(Ordering::Relaxed) {
-        let mut state = match env.reset() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        if need_reset {
+            state = match env.reset() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            need_reset = false;
+        }
         episodes += 1;
         let mut ep_reward = 0.0f64;
         let mut ep_steps = 0u64;
@@ -1088,6 +1381,9 @@ fn worker_loop(
             state = result.state;
 
             if result.done || ep_steps > 10_000 {
+                if result.game_over {
+                    need_reset = true;
+                }
                 break;
             }
         }
@@ -1117,13 +1413,19 @@ struct DqnAgent {
     device: Device,
     gamma: f64,
     epsilon: f64,
-    epsilon_min: f64,
-    epsilon_decay: f64,
+    epsilon_start: f64,
+    epsilon_end: f64,
+    epsilon_decay_steps: u64,
+    tau: f64,
+    max_grad_norm: f64,
+    initial_lr: f64,
+    lr_decay_start: u64,
+    lr_decay_factor: f64,
     replay: ReplayBuffer,
     batch_size: usize,
     learn_start: usize,
     train_freq: u64,
-    target_update_freq: u64,
+    total_env_steps: u64,
     steps: u64,
     rng: SmallRng,
 }
@@ -1137,8 +1439,9 @@ impl DqnAgent {
         let online_net = DqnNet::new(online_vb)?;
         let target_net = DqnNet::new(target_vb)?;
 
+        let initial_lr = 1e-4;
         let opt_params = ParamsAdamW {
-            lr: 2.5e-4,
+            lr: initial_lr,
             weight_decay: 1e-5,
             ..Default::default()
         };
@@ -1153,18 +1456,46 @@ impl DqnAgent {
             device: device.clone(),
             gamma: 0.99,
             epsilon: 1.0,
-            epsilon_min: 0.02,
-            epsilon_decay: 0.99999,
-            replay: ReplayBuffer::new(200_000),
+            epsilon_start: 1.0,
+            epsilon_end: 0.05,
+            epsilon_decay_steps: 2_000_000,
+            tau: 0.005,
+            max_grad_norm: 10.0,
+            initial_lr,
+            lr_decay_start: 1_000_000,
+            lr_decay_factor: 0.5,
+            replay: ReplayBuffer::new(1_000_000),
             batch_size: 64,
-            learn_start: 1000,
+            learn_start: 10_000,
             train_freq: 4,
-            target_update_freq: 1000,
+            total_env_steps: 0,
             steps: 0,
             rng: SmallRng::from_os_rng(),
         };
         agent.hard_update_target()?;
         Ok(agent)
+    }
+
+    fn resume_from(&mut self, resume_dir: &Path) -> Result<(TrainMeta, ReplayBuffer)> {
+        let model_path = resume_dir.join("model.safetensors");
+        let target_path = resume_dir.join("target.safetensors");
+        let optimizer_path = resume_dir.join("optimizer.safetensors");
+        let replay_bin_path = resume_dir.join("replay.bin");
+        let meta_path = resume_dir.join("meta.json");
+
+        self.online_varmap.load(&model_path)?;
+        self.target_varmap.load(&target_path)?;
+        if let Err(err) = self.load_optimizer(&optimizer_path) {
+            eprintln!(
+                "Optimizer state load failed ({err}). Continuing with fresh optimizer state."
+            );
+        }
+        let replay = ReplayBuffer::load(&replay_bin_path)?;
+
+        let file = File::open(&meta_path)?;
+        let reader = std::io::BufReader::new(file);
+        let meta: TrainMeta = serde_json::from_reader(reader)?;
+        Ok((meta, replay))
     }
 
     fn train_step(&mut self) -> Result<f32> {
@@ -1206,13 +1537,19 @@ impl DqnAgent {
             )?
             .mean_all()?;
 
-        self.optimizer.backward_step(&loss)?;
+        self.optimizer
+            .backward_step(&loss, Some(self.max_grad_norm))?;
 
-        if self.steps.is_multiple_of(self.target_update_freq) {
-            self.hard_update_target()?;
+        self.soft_update_target()?;
+
+        let progress = (self.total_env_steps as f64) / (self.epsilon_decay_steps as f64);
+        self.epsilon =
+            self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
+
+        if self.total_env_steps > self.lr_decay_start {
+            let decayed_lr = self.initial_lr * self.lr_decay_factor;
+            self.optimizer.set_learning_rate(decayed_lr);
         }
-
-        self.epsilon = (self.epsilon * self.epsilon_decay).max(self.epsilon_min);
 
         loss.to_scalar::<f32>().map_err(Into::into)
     }
@@ -1222,17 +1559,42 @@ impl DqnAgent {
             .online_varmap
             .data()
             .lock()
-            .map_err(|_| anyhow::anyhow!("lock failed"))?;
+            .map_err(|_| anyhow::anyhow!("Failed to lock online varmap for hard update"))?;
         let mut target_data = self
             .target_varmap
             .data()
             .lock()
-            .map_err(|_| anyhow::anyhow!("lock failed"))?;
+            .map_err(|_| anyhow::anyhow!("Failed to lock target varmap for hard update"))?;
         for (name, target_v) in target_data.iter_mut() {
-            let online_v = online_data
-                .get(name)
-                .ok_or_else(|| anyhow::anyhow!("Missing var {name}"))?;
+            let online_v = online_data.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Missing var {name} in online varmap during hard update")
+            })?;
             target_v.set(&online_v.as_tensor().detach())?;
+        }
+        Ok(())
+    }
+
+    fn soft_update_target(&mut self) -> Result<()> {
+        let tau = self.tau as f32;
+        let online_data = self
+            .online_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock online varmap for soft update"))?;
+        let mut target_data = self
+            .target_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock target varmap for soft update"))?;
+        for (name, target_v) in target_data.iter_mut() {
+            let online_v = online_data.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Missing var {name} in online varmap during soft update")
+            })?;
+            let new_val = online_v
+                .as_tensor()
+                .affine(tau as f64, 0.0)?
+                .add(&target_v.as_tensor().affine((1.0 - tau) as f64, 0.0)?)?;
+            target_v.set(&new_val.detach())?;
         }
         Ok(())
     }
@@ -1249,6 +1611,14 @@ impl DqnAgent {
         self.hard_update_target()?;
         eprintln!("Model loaded from {path}");
         Ok(())
+    }
+
+    fn save_optimizer<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.optimizer.save_state(path)
+    }
+
+    fn load_optimizer<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        self.optimizer.load_state(path)
     }
 }
 
@@ -1308,25 +1678,22 @@ fn main() -> Result<()> {
     let mut agent = DqnAgent::new(&device)?;
     let mut best_reward = f64::NEG_INFINITY;
     let mut total_steps: u64 = 0;
+    let mut episode: u64 = 0;
 
     if let Some(resume_dir) = args.resume.as_ref() {
-        let model_path = resume_dir.join("model.safetensors");
-        let target_path = resume_dir.join("target.safetensors");
-        let meta_path = resume_dir.join("meta.json");
-
-        agent.online_varmap.load(&model_path)?;
-        agent.target_varmap.load(&target_path)?;
-
-        let file = File::open(&meta_path)?;
-        let reader = std::io::BufReader::new(file);
-        let meta: serde_json::Value = serde_json::from_reader(reader)?;
-        best_reward = meta["best_reward"].as_f64().unwrap_or(f64::NEG_INFINITY);
-        total_steps = meta["total_steps"].as_u64().unwrap_or(0);
-        agent.epsilon = meta["epsilon"].as_f64().unwrap_or(1.0);
-        agent.steps = meta["agent_steps"].as_u64().unwrap_or(0);
+        let (meta, replay) = agent.resume_from(resume_dir)?;
+        best_reward = meta.best_reward;
+        episode = meta.episode;
+        total_steps = meta.total_steps;
+        agent.epsilon = meta.epsilon;
+        agent.steps = meta.agent_steps;
+        agent.total_env_steps = total_steps;
+        agent.replay = replay;
         eprintln!(
-            "Resumed from {} (steps={total_steps}, eps={:.4})",
+            "Resumed from {} (steps={}, episode={}, epsilon={:.4})",
             resume_dir.display(),
+            total_steps,
+            episode,
             agent.epsilon
         );
     }
@@ -1372,7 +1739,16 @@ fn main() -> Result<()> {
     eprintln!("Workers spawned. Training...\n");
 
     let t_start = Instant::now();
-    let _recent_rewards: VecDeque<f64> = VecDeque::with_capacity(100);
+    let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(100);
+    if let Some(resume_dir) = args.resume.as_ref() {
+        let rewards_path = resume_dir.join("recent_rewards.json");
+        if rewards_path.exists() {
+            let file = File::open(&rewards_path)?;
+            let reader = std::io::BufReader::new(file);
+            let rewards: Vec<f64> = serde_json::from_reader(reader)?;
+            recent_rewards = VecDeque::from(rewards);
+        }
+    }
     let mut ep_loss = 0.0f32;
     let mut loss_count = 0u32;
     let mut last_log = Instant::now();
@@ -1389,6 +1765,7 @@ fn main() -> Result<()> {
                 Ok(t) => {
                     agent.replay.push(t);
                     total_steps += 1;
+                    agent.total_env_steps = total_steps;
                     drained += 1;
 
                     let loss = agent.train_step()?;
@@ -1415,6 +1792,7 @@ fn main() -> Result<()> {
                 Ok(t) => {
                     agent.replay.push(t);
                     total_steps += 1;
+                    agent.total_env_steps = total_steps;
 
                     let loss = agent.train_step()?;
                     if loss > 0.0 {
@@ -1452,21 +1830,47 @@ fn main() -> Result<()> {
             let mut total_worker_steps = 0u64;
             let mut best_score = 0u32;
             let mut best_kills = 0u8;
+            let mut total_worker_reward = 0.0f64;
+            let mut worker_reward_samples = 0u64;
             for ws in &worker_stats {
                 if let Ok(s) = ws.read() {
                     total_worker_eps += s.episodes;
                     total_worker_steps += s.steps;
+                    total_worker_reward += s.total_reward;
+                    worker_reward_samples += 1;
                     if s.last_score > best_score {
                         best_score = s.last_score;
                     }
                     if s.last_kills > best_kills {
                         best_kills = s.last_kills;
                     }
-                    if s.total_reward > best_reward {
-                        best_reward = s.total_reward;
-                    }
                 }
             }
+
+            let avg_worker_reward = if worker_reward_samples > 0 {
+                total_worker_reward / worker_reward_samples as f64
+            } else {
+                0.0
+            };
+            recent_rewards.push_back(avg_worker_reward);
+            if recent_rewards.len() > 100 {
+                recent_rewards.pop_front();
+            }
+
+            let avg_reward = if recent_rewards.is_empty() {
+                0.0
+            } else {
+                recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
+            };
+
+            if recent_rewards.len() >= 100 && avg_reward > best_reward {
+                best_reward = avg_reward;
+                agent.save("checkpoints/best.safetensors")?;
+                save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+                save_recent_rewards(&recent_rewards, "checkpoints")?;
+            }
+
+            episode = total_worker_eps;
 
             eprintln!(
                 "Steps {total_steps:>8} | Replay {:>6} | BestR {best_reward:>7.1} | Score {best_score:>6} | Kills {best_kills:>3} | ε {eps:.4} | Loss {avg_loss:.5} | FPS {fps:.0} | W_eps {total_worker_eps} | W_steps {total_worker_steps}",
@@ -1480,14 +1884,31 @@ fn main() -> Result<()> {
         }
 
         if total_steps - last_save_steps >= 50_000 {
+            let mut total_worker_eps = 0u64;
+            for ws in &worker_stats {
+                if let Ok(s) = ws.read() {
+                    total_worker_eps += s.episodes;
+                }
+            }
+            episode = total_worker_eps;
             agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
-            agent.save("checkpoints/best.safetensors")?;
+            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+            save_recent_rewards(&recent_rewards, "checkpoints")?;
             last_save_steps = total_steps;
         }
     }
 
     stop.store(true, Ordering::Relaxed);
     agent.save("checkpoints/final.safetensors")?;
+    let mut total_worker_eps = 0u64;
+    for ws in &worker_stats {
+        if let Ok(s) = ws.read() {
+            total_worker_eps += s.episodes;
+        }
+    }
+    episode = total_worker_eps;
+    save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
+    save_recent_rewards(&recent_rewards, "checkpoints")?;
 
     for h in handles {
         let _ = h.join();
