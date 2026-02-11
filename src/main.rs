@@ -794,6 +794,8 @@ impl NesEnv {
                     self.session_state = SessionState::WaitForTitle;
                     self.countdown_seen = false;
                 }
+                self.prev_state = state;
+                break; // Stop frame_skip on any life loss to avoid garbage rewards
             }
 
             self.prev_state = state;
@@ -832,20 +834,25 @@ impl NesEnv {
             reward += kill_delta as f64 * 5.0;
         }
 
-        // 1b. Partial damage on multi-hit enemies (avoid double-counting kills)
+        // 1b. Partial damage on multi-hit enemies
+        // Guard against slot recycling: require same enemy type and reasonable drop
         for i in 0..4 {
-            if prev.enemy_active[i] && cur.enemy_active[i] {
+            if prev.enemy_active[i]
+                && cur.enemy_active[i]
+                && prev.enemy_type[i] == cur.enemy_type[i]
+            {
                 let prev_energy = prev.enemy_energy[i];
                 let cur_energy = cur.enemy_energy[i];
-                if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF {
-                    reward += (prev_energy - cur_energy) as f64 * 2.0;
+                let drop = prev_energy.wrapping_sub(cur_energy);
+                if prev_energy > 0 && cur_energy < prev_energy && cur_energy != 0xFF && drop <= 4 {
+                    reward += drop as f64 * 2.0;
                 }
             }
         }
 
-        // 2. Score delta (normalized)
+        // 2. Score delta (normalized, tighter sanity check)
         let score_delta = cur.score as i64 - prev.score as i64;
-        if score_delta > 0 && score_delta < 50_000 {
+        if score_delta > 0 && score_delta < 5_000 {
             reward += score_delta as f64 / 100.0;
         }
 
@@ -853,7 +860,7 @@ impl NesEnv {
         if cur.player_hp != 0xFF && prev.player_hp != 0xFF {
             let hp_delta = cur.player_hp as i32 - prev.player_hp as i32;
             if hp_delta < 0 && hp_delta > -200 {
-                reward += hp_delta as f64 * 0.5; // Negative
+                reward += hp_delta as f64 * 0.5;
             }
         }
 
@@ -1160,10 +1167,6 @@ impl AdamW {
             params,
             step_t: 0,
         })
-    }
-
-    fn learning_rate(&self) -> f64 {
-        self.params.lr
     }
 
     fn set_learning_rate(&mut self, lr: f64) {
@@ -1584,6 +1587,8 @@ fn train(args: &TrainArgs) -> Result<()> {
     }
     let t_start = Instant::now();
 
+    let mut all_time_top_score: u32 = 0;
+
     let mut last_render_ep = 0u64;
     let mut last_render_steps = 0u64;
     let mut last_render_reward = 0.0f64;
@@ -1724,8 +1729,8 @@ fn train(args: &TrainArgs) -> Result<()> {
             0.0
         };
 
-        if ep_reward > best_reward {
-            best_reward = ep_reward;
+        if recent_rewards.len() >= 100 && avg_reward > best_reward {
+            best_reward = avg_reward;
             agent.save("checkpoints/best.safetensors")?;
             save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
             save_recent_rewards(&recent_rewards, "checkpoints")?;
@@ -1734,13 +1739,16 @@ fn train(args: &TrainArgs) -> Result<()> {
         let elapsed = t_start.elapsed().as_secs_f64();
         let fps = total_steps as f64 / elapsed;
 
+        let ep_score = env.prev_state.score;
+        if ep_score > all_time_top_score {
+            all_time_top_score = ep_score;
+        }
+
         if episode.is_multiple_of(10) || ep_reward > best_reward - 1.0 {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
-                 Avg100 {avg_reward:>7.1} | Score {score:>6} | Top {top:>6} | Kills {kills:>3} | \
+                 Avg100 {avg_reward:>7.1} | Score {ep_score:>6} | Top {all_time_top_score:>6} | Kills {kills:>3} | \
                  ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0}",
-                score = env.prev_state.score,
-                top = env.prev_state.top_score,
                 kills = env.prev_state.kill_count,
                 eps = agent.epsilon,
                 loss = avg_loss,
@@ -1751,8 +1759,8 @@ fn train(args: &TrainArgs) -> Result<()> {
         last_render_steps = total_steps;
         last_render_reward = ep_reward;
         last_render_avg = avg_reward;
-        last_render_score = env.prev_state.score;
-        last_render_top = env.prev_state.top_score;
+        last_render_score = ep_score;
+        last_render_top = all_time_top_score;
         last_render_kills = env.prev_state.kill_count;
     }
 

@@ -1243,6 +1243,7 @@ impl DqnAgent {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn load(&mut self, path: &str) -> Result<()> {
         self.online_varmap.load(path)?;
         self.hard_update_target()?;
