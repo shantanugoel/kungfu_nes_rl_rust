@@ -380,6 +380,7 @@ pub struct NesEnv {
     progress_start_global_x: i32,
     progress_best: i32,
     rng: SmallRng,
+    pub min_page_reached: u8,
 }
 
 impl NesEnv {
@@ -422,6 +423,7 @@ impl NesEnv {
             progress_start_global_x: 0,
             progress_best: 0,
             rng: SmallRng::from_os_rng(),
+            min_page_reached: 6,
         })
     }
 
@@ -739,7 +741,7 @@ impl NesEnv {
             self.clock_frame()?;
         }
 
-        let state = self.run_state_machine(600)?;
+        let mut state = self.run_state_machine(600)?;
         self.log_state("reset", &state);
         if self.session_state != SessionState::Playing {
             return Err(anyhow::anyhow!(
@@ -749,7 +751,16 @@ impl NesEnv {
                 timer = state.start_timer
             ));
         }
+        // WAIT for Auto-Walk to finish (Wait until player_x reaches 0x7F and stops)
+        let mut timeout = 0;
+        while state.player_x > 0x7F && timeout < 500 {
+            self.clock_frame()?;
+            state = self.read_state();
+            timeout += 1;
+        }
+
         self.prev_state = state;
+        self.min_page_reached = self.prev_state.page;
         self.total_reward = 0.0;
         self.steps = 0;
         self.last_action = Action::Noop;
@@ -934,14 +945,35 @@ impl NesEnv {
             self.progress_start_global_x = cur_global_x;
             self.progress_best = 0;
         } else {
-            let progress = if cur.floor % 2 == 0 {
+            let progress = if cur.floor.is_multiple_of(2) {
                 self.progress_start_global_x - cur_global_x
             } else {
                 cur_global_x - self.progress_start_global_x
             };
             if progress > self.progress_best {
                 let delta = (progress - self.progress_best).min(128);
-                if delta > 0 {
+                // Still cap the delta to 15 pixels per step
+                // to prevent rewards for dying/respawning/warping.
+                if delta > 0 && delta < 15 {
+                    if self.reward_debug {
+                        let dir = if cur.floor.is_multiple_of(2) {
+                            "L"
+                        } else {
+                            "R"
+                        };
+                        // eprintln!(
+                        //     "[reward:move] floor={} dir={} page={} x=0x{:02X} global={} start={} progress={} prev_best={} delta={}",
+                        //     cur.floor,
+                        //     dir,
+                        //     cur.page,
+                        //     cur.player_x,
+                        //     cur_global_x,
+                        //     self.progress_start_global_x,
+                        //     progress,
+                        //     self.progress_best,
+                        //     delta
+                        // );
+                    }
                     movement_reward += delta as f64 * 0.05;
                     self.progress_best = progress;
                 }
@@ -961,6 +993,10 @@ impl NesEnv {
 
         // 7. Time penalty
         reward += time_penalty;
+
+        if cur.page < self.min_page_reached && cur.page > 0 {
+            self.min_page_reached = cur.page;
+        }
 
         reward +=
             energy_reward + score_reward + hp_penalty + movement_reward + floor_bonus + boss_reward;
@@ -1878,9 +1914,10 @@ fn train(args: &TrainArgs) -> Result<()> {
             eprintln!(
                 "Ep {episode:>5} | Steps {total_steps:>8} | R {ep_reward:>8.1} | \
                  Avg100 {avg_reward:>7.1} | Score {ep_score:>6} | Top {all_time_top_score:>6} | Kills {ep_kills:>3} | \
-                 ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0}",
+                 ε {eps:.4} | Loss {loss:.5} | FPS {fps:.0} | MinPg {min_pg}",
                 eps = agent.epsilon,
                 loss = avg_loss,
+                min_pg = env.min_page_reached,
             );
             if env.reward_debug_enabled() {
                 let breakdown = env.reward_breakdown();
