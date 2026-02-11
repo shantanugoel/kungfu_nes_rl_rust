@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
 use tetanes_core::mem::Read;
 use tetanes_core::prelude::*;
