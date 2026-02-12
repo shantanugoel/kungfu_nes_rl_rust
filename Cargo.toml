@@ -5,9 +5,7 @@ edition = "2024"
 
 [dependencies]
 tetanes-core = "0.12"
-candle-core = { version = "0.9", features = ["metal"] }
 candle-nn = "0.9"
-accelerate-src = { version = "0.3", optional = true } # needed on macOS for linking
 minifb = "0.28"                               # lightweight framebuffer for visualization
 rand = "0.9"
 clap = { version = "4", features = ["derive"] }
@@ -19,6 +17,12 @@ bincode = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9", features = ["metal", "accelerate"] }
+accelerate-src = "0.3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = { version = "0.9", features = ["cudnn"] }
+
 [features]
-default = ["accelerate"]
-accelerate = ["candle-core/accelerate", "dep:accelerate-src"]
+default = []

@@ -1,4 +1,3 @@
-#[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
 pub const STATE_DIM: usize = 84;
