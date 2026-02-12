@@ -33,7 +33,18 @@ fn train(args: &TrainArgs) -> Result<()> {
     let device = if args.cpu {
         candle_core::Device::Cpu
     } else {
-        candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        #[cfg(target_os = "macos")]
+        {
+            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
+        }
     };
     eprintln!("Device: {:?}", device);
 
