@@ -27,6 +27,8 @@ pub struct TrainParallelArgs {
     pub cpu: bool,
     #[arg(long)]
     pub workers: Option<usize>,
+    #[arg(long, default_value = "checkpoints")]
+    pub checkpoint_dir: PathBuf,
     #[arg(long)]
     pub resume: Option<PathBuf>,
 }
@@ -262,7 +264,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
         );
     }
 
-    std::fs::create_dir_all("checkpoints")?;
+    std::fs::create_dir_all(&args.checkpoint_dir)?;
 
     let weight_version = Arc::new(AtomicU64::new(1));
     let initial_snapshot = snapshot_varmap(&agent.online_varmap, 1)?;
@@ -429,9 +431,16 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
 
             if recent_rewards.len() >= 100 && avg_reward > best_reward {
                 best_reward = avg_reward;
-                agent.save("checkpoints/best.safetensors")?;
-                save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-                save_recent_rewards(&recent_rewards, "checkpoints")?;
+                let best_path = args.checkpoint_dir.join("best.safetensors");
+                agent.save(&best_path.to_string_lossy())?;
+                save_checkpoint(
+                    &agent,
+                    best_reward,
+                    episode,
+                    total_steps,
+                    &args.checkpoint_dir,
+                )?;
+                save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
             }
 
             episode = total_worker_eps;
@@ -455,15 +464,25 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
                 }
             }
             episode = total_worker_eps;
-            agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
-            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-            save_recent_rewards(&recent_rewards, "checkpoints")?;
+            let step_path = args
+                .checkpoint_dir
+                .join(format!("step_{total_steps}.safetensors"));
+            agent.save(&step_path.to_string_lossy())?;
+            save_checkpoint(
+                &agent,
+                best_reward,
+                episode,
+                total_steps,
+                &args.checkpoint_dir,
+            )?;
+            save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
             last_save_steps = total_steps;
         }
     }
 
     stop.store(true, Ordering::Relaxed);
-    agent.save("checkpoints/final.safetensors")?;
+    let final_path = args.checkpoint_dir.join("final.safetensors");
+    agent.save(&final_path.to_string_lossy())?;
     let mut total_worker_eps = 0u64;
     for ws in &worker_stats {
         if let Ok(s) = ws.read() {
@@ -471,8 +490,14 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
         }
     }
     episode = total_worker_eps;
-    save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-    save_recent_rewards(&recent_rewards, "checkpoints")?;
+    save_checkpoint(
+        &agent,
+        best_reward,
+        episode,
+        total_steps,
+        &args.checkpoint_dir,
+    )?;
+    save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
 
     for h in handles {
         let _ = h.join();
