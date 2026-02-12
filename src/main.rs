@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kungfu_rl_rs::dqn::{save_checkpoint, save_recent_rewards, AgentConfig, DqnAgent, Transition};
 use kungfu_rl_rs::env::{ram, Action, EnvConfig, NesEnv, RewardConfig};
+use kungfu_rl_rs::train_parallel::{self, TrainParallelArgs};
 use kungfu_rl_rs::Features;
 use rand::Rng;
 use std::collections::VecDeque;
@@ -700,6 +701,7 @@ struct Cli {
 enum Commands {
     Explore(ExploreArgs),
     Train(TrainArgs),
+    TrainParallel(TrainParallelArgs),
     Play(PlayArgs),
     Manual(ManualArgs),
     Baseline(BaselineArgs),
@@ -781,6 +783,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Explore(args) => explore(args),
         Commands::Train(args) => train(args),
+        Commands::TrainParallel(args) => train_parallel::train_parallel(args),
         Commands::Play(args) => play(args),
         Commands::Manual(args) => manual(args),
         Commands::Baseline(args) => baseline(args),
