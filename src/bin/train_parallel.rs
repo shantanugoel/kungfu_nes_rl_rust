@@ -753,7 +753,7 @@ impl NesEnv {
             self.progress_start_global_x = cur_global_x;
             self.progress_best = 0;
         } else {
-            let progress = if cur.floor % 2 == 0 {
+            let progress = if cur.floor.is_multiple_of(2) {
                 self.progress_start_global_x - cur_global_x
             } else {
                 cur_global_x - self.progress_start_global_x
