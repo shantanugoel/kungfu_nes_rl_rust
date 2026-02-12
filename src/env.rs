@@ -261,10 +261,38 @@ impl GameState {
         };
         f[idx] = hp / 48.0;
         idx += 1;
-        f[idx] = self.player_lives as f32 / 5.0;
+        let facing_right = if self.player_state & 0x01 == 0 {
+            0.0
+        } else {
+            1.0
+        };
+        let stance_code = ((self.player_state & 0x06) >> 1) as usize;
+        let attack_code = ((self.player_state >> 4) & 0x0F) as usize;
+        debug_assert!(
+            stance_code < 3,
+            "unexpected player stance code: {}",
+            stance_code
+        );
+        debug_assert!(
+            attack_code < 3,
+            "unexpected player attack code: {}",
+            attack_code
+        );
+
+        f[idx] = facing_right;
         idx += 1;
-        f[idx] = self.player_state as f32 / 255.0;
-        idx += 1;
+        let mut stance_oh = [0.0f32; 3];
+        stance_oh[stance_code.min(2)] = 1.0;
+        for &v in &stance_oh {
+            f[idx] = v;
+            idx += 1;
+        }
+        let mut attack_oh = [0.0f32; 3];
+        attack_oh[attack_code.min(2)] = 1.0;
+        for &v in &attack_oh {
+            f[idx] = v;
+            idx += 1;
+        }
         f[idx] = self.floor as f32 / 5.0;
         idx += 1;
 
@@ -274,8 +302,7 @@ impl GameState {
             active: f32,
             dx: f32,
             dy: f32,
-            abs_dx: f32,
-            enemy_type: f32,
+            enemy_type: [f32; 8],
             facing: f32,
         }
 
@@ -284,28 +311,32 @@ impl GameState {
             active: 0.0,
             dx: 0.0,
             dy: 0.0,
-            abs_dx: 0.0,
-            enemy_type: 0.0,
+            enemy_type: [0.0; 8],
             facing: 0.0,
         }; 4];
         for (i, enemy_slot) in enemies.iter_mut().enumerate() {
             if self.enemy_active[i] {
                 let mut dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
                 let dy_raw = self.enemy_y[i] as f32 - self.player_y as f32;
+                // Ensure it remains 0 or 1 in case raw value changes
+                let facing = if self.enemy_facing[i] == 0 { 0.0 } else { 1.0 };
+
                 if dx_raw > 128.0 {
                     dx_raw -= 256.0;
                 } else if dx_raw < -128.0 {
                     dx_raw += 256.0;
                 }
                 let abs_dx = dx_raw.abs() / 255.0;
+                let mut enemy_type = [0.0f32; 8];
+                let type_idx = (self.enemy_type[i] as usize).min(7);
+                enemy_type[type_idx] = 1.0;
                 *enemy_slot = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
                     dx: dx_raw / 128.0,
                     dy: dy_raw / 128.0,
-                    abs_dx,
-                    enemy_type: self.enemy_type[i] as f32 / 7.0,
-                    facing: self.enemy_facing[i] as f32,
+                    enemy_type,
+                    facing,
                 };
             }
         }
@@ -323,40 +354,80 @@ impl GameState {
             idx += 1;
             f[idx] = enemy.dy;
             idx += 1;
-            f[idx] = enemy.abs_dx;
-            idx += 1;
-            f[idx] = enemy.enemy_type;
-            idx += 1;
+            for &t in &enemy.enemy_type {
+                f[idx] = t;
+                idx += 1;
+            }
             f[idx] = enemy.facing;
             idx += 1;
         }
 
-        for i in 0..4 {
-            let active = self.knife_active[i];
-            f[idx] = if active { 1.0 } else { 0.0 };
-            idx += 1;
-            if active {
-                f[idx] = self.knife_x[i] as f32 / 255.0;
-                idx += 1;
-                f[idx] = self.knife_y[i] as f32 / 255.0;
-                idx += 1;
-                f[idx] = self.knife_facing[i] as f32;
-                idx += 1;
-            } else {
-                f[idx] = 0.0;
-                idx += 1;
-                f[idx] = 0.0;
-                idx += 1;
-                f[idx] = 0.0;
-                idx += 1;
+        #[derive(Clone, Copy)]
+        struct KnifeFeatures {
+            sort_key: f32,
+            active: f32,
+            dx: f32,
+            dy: f32,
+            facing: f32,
+        }
+
+        let mut knives: [KnifeFeatures; 4] = [KnifeFeatures {
+            sort_key: f32::INFINITY,
+            active: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            facing: 0.0,
+        }; 4];
+
+        for (i, knife_slot) in knives.iter_mut().enumerate() {
+            if self.knife_active[i] {
+                let mut dx_raw = self.knife_x[i] as f32 - self.player_x as f32;
+                let dy_raw = self.knife_y[i] as f32 - self.player_y as f32;
+                let facing = if self.knife_facing[i] == 0 { 0.0 } else { 1.0 };
+
+                if dx_raw > 128.0 {
+                    dx_raw -= 256.0;
+                } else if dx_raw < -128.0 {
+                    dx_raw += 256.0;
+                }
+                let abs_dx = dx_raw.abs() / 255.0;
+                *knife_slot = KnifeFeatures {
+                    sort_key: abs_dx,
+                    active: 1.0,
+                    dx: dx_raw / 128.0,
+                    dy: dy_raw / 128.0,
+                    facing,
+                };
             }
+        }
+
+        knives.sort_unstable_by(|a, b| {
+            a.sort_key
+                .partial_cmp(&b.sort_key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for knife in &knives {
+            f[idx] = knife.active;
+            idx += 1;
+            f[idx] = knife.dx;
+            idx += 1;
+            f[idx] = knife.dy;
+            idx += 1;
+            f[idx] = knife.facing;
+            idx += 1;
         }
 
         f[idx] = self.boss_hp as f32 / 255.0;
         idx += 1;
         f[idx] = (self.timer.min(9999) as f32) / 9999.0;
         idx += 1;
-        f[idx] = self.kill_count as f32 / 255.0;
+
+        debug_assert_eq!(
+            idx, STATE_DIM,
+            "Feature index mismatch: got {}, expected {}",
+            idx, STATE_DIM
+        );
 
         f
     }
