@@ -274,14 +274,23 @@ impl GameState {
         }; 4];
         for i in 0..4 {
             if self.enemy_active[i] {
-                let dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
+                let mut dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
                 let dy_raw = self.enemy_y[i] as f32 - self.player_y as f32;
+                // Handle the wrap-around (Modulo Arithmetic)
+                // If distance is huge positive, enemy is actually to the left.
+                if dx_raw > 128.0 {
+                    dx_raw -= 256.0;
+                }
+                // If distance is huge negative, enemy is actually to the right.
+                else if dx_raw < -128.0 {
+                    dx_raw += 256.0;
+                }
                 let abs_dx = dx_raw.abs() / 255.0;
                 enemies[i] = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
-                    dx: dx_raw / 255.0,
-                    dy: dy_raw / 255.0,
+                    dx: dx_raw / 128.0,
+                    dy: dy_raw / 128.0,
                     abs_dx,
                     enemy_type: self.enemy_type[i] as f32 / 7.0,
                     facing: self.enemy_facing[i] as f32,
@@ -955,26 +964,26 @@ impl NesEnv {
                 // Still cap the delta to 15 pixels per step
                 // to prevent rewards for dying/respawning/warping.
                 if delta > 0 && delta < 15 {
-                    if self.reward_debug {
-                        let dir = if cur.floor.is_multiple_of(2) {
-                            "L"
-                        } else {
-                            "R"
-                        };
-                        // eprintln!(
-                        //     "[reward:move] floor={} dir={} page={} x=0x{:02X} global={} start={} progress={} prev_best={} delta={}",
-                        //     cur.floor,
-                        //     dir,
-                        //     cur.page,
-                        //     cur.player_x,
-                        //     cur_global_x,
-                        //     self.progress_start_global_x,
-                        //     progress,
-                        //     self.progress_best,
-                        //     delta
-                        // );
-                    }
-                    movement_reward += delta as f64 * 0.05;
+                    // if self.reward_debug {
+                    //     let dir = if cur.floor.is_multiple_of(2) {
+                    //         "L"
+                    //     } else {
+                    //         "R"
+                    //     };
+                    // eprintln!(
+                    //     "[reward:move] floor={} dir={} page={} x=0x{:02X} global={} start={} progress={} prev_best={} delta={}",
+                    //     cur.floor,
+                    //     dir,
+                    //     cur.page,
+                    //     cur.player_x,
+                    //     cur_global_x,
+                    //     self.progress_start_global_x,
+                    //     progress,
+                    //     self.progress_best,
+                    //     delta
+                    // );
+                    // }
+                    movement_reward += delta as f64 * 0.1;
                     self.progress_best = progress;
                 }
             }
