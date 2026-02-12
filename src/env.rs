@@ -288,7 +288,7 @@ impl GameState {
             enemy_type: 0.0,
             facing: 0.0,
         }; 4];
-        for i in 0..4 {
+        for (i, enemy_slot) in enemies.iter_mut().enumerate() {
             if self.enemy_active[i] {
                 let mut dx_raw = self.enemy_x[i] as f32 - self.player_x as f32;
                 let dy_raw = self.enemy_y[i] as f32 - self.player_y as f32;
@@ -298,7 +298,7 @@ impl GameState {
                     dx_raw += 256.0;
                 }
                 let abs_dx = dx_raw.abs() / 255.0;
-                enemies[i] = EnemyFeatures {
+                *enemy_slot = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
                     dx: dx_raw / 128.0,
@@ -682,24 +682,26 @@ impl NesEnv {
     }
 
     fn read_state(&self) -> GameState {
-        let mut state = GameState::default();
-        state.player_x = self.peek(ram::PLAYER_X);
-        state.player_y = self.peek(ram::PLAYER_Y);
-        state.player_hp = self.peek(ram::PLAYER_HP);
-        state.player_lives = self.peek(ram::PLAYER_LIVES);
-        state.player_state = self.peek(ram::PLAYER_STATE);
-        state.page = self.peek(ram::PAGE);
-        state.game_mode = self.peek(ram::GAME_MODE);
-        state.start_timer = self.peek(ram::START_TIMER);
-        state.score = self.read_score();
-        state.top_score = ram::TOP_SCORE_DIGITS
-            .as_ref()
-            .map(|digits| self.read_score_digits(digits))
-            .unwrap_or(0);
-        state.kill_count = self.peek(ram::KILL_COUNTER);
-        state.boss_hp = ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0);
-        state.floor = self.peek(ram::FLOOR);
-        state.timer = self.read_timer();
+        let mut state = GameState {
+            player_x: self.peek(ram::PLAYER_X),
+            player_y: self.peek(ram::PLAYER_Y),
+            player_hp: self.peek(ram::PLAYER_HP),
+            player_lives: self.peek(ram::PLAYER_LIVES),
+            player_state: self.peek(ram::PLAYER_STATE),
+            page: self.peek(ram::PAGE),
+            game_mode: self.peek(ram::GAME_MODE),
+            start_timer: self.peek(ram::START_TIMER),
+            score: self.read_score(),
+            top_score: ram::TOP_SCORE_DIGITS
+                .as_ref()
+                .map(|digits| self.read_score_digits(digits))
+                .unwrap_or(0),
+            kill_count: self.peek(ram::KILL_COUNTER),
+            boss_hp: ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0),
+            floor: self.peek(ram::FLOOR),
+            timer: self.read_timer(),
+            ..Default::default()
+        };
 
         for i in 0..4 {
             state.enemy_x[i] = self.peek(ram::ENEMY_X[i]);

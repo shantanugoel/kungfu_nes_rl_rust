@@ -156,6 +156,10 @@ impl ReplayBuffer {
         self.buffer.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let file = File::create(path.as_ref())?;
         let writer = std::io::BufWriter::new(file);
