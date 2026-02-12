@@ -29,6 +29,7 @@ pub struct AgentConfig {
     pub weight_decay: f64,
     pub lr_decay_start: u64,
     pub lr_decay_factor: f64,
+    pub total_timesteps: u64,
     pub replay_capacity: usize,
     pub batch_size: usize,
     pub learn_start: usize,
@@ -38,8 +39,8 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            hidden_size: 256,
-            dueling_hidden_size: 128,
+            hidden_size: 512,
+            dueling_hidden_size: 256,
             gamma: 0.99,
             epsilon_start: 1.0,
             epsilon_end: 0.02,
@@ -50,9 +51,10 @@ impl Default for AgentConfig {
             weight_decay: 1e-5,
             lr_decay_start: 1_000_000,
             lr_decay_factor: 0.5,
+            total_timesteps: 5_000_000,
             replay_capacity: 1_000_000,
-            batch_size: 64,
-            learn_start: 10_000,
+            batch_size: 256,
+            learn_start: 20_000,
             train_freq: 4,
         }
     }
@@ -285,6 +287,7 @@ pub struct DqnAgent {
     initial_lr: f64,
     lr_decay_start: u64,
     lr_decay_factor: f64,
+    total_timesteps: u64,
     pub replay: ReplayBuffer,
     batch_size: usize,
     learn_start: usize,
@@ -492,6 +495,7 @@ impl DqnAgent {
             initial_lr: config.initial_lr,
             lr_decay_start: config.lr_decay_start,
             lr_decay_factor: config.lr_decay_factor,
+            total_timesteps: config.total_timesteps,
             replay: ReplayBuffer::new(config.replay_capacity),
             batch_size: config.batch_size,
             learn_start: config.learn_start,
@@ -603,9 +607,15 @@ impl DqnAgent {
         self.epsilon =
             self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
 
-        // LR decay after lr_decay_start steps
-        if self.total_env_steps > self.lr_decay_start {
-            let decayed_lr = self.initial_lr * self.lr_decay_factor;
+        // Cosine LR decay after lr_decay_start steps
+        if self.total_env_steps >= self.lr_decay_start && self.total_timesteps > self.lr_decay_start
+        {
+            let progress = (self.total_env_steps - self.lr_decay_start) as f64
+                / (self.total_timesteps - self.lr_decay_start) as f64;
+            let clamped = progress.min(1.0).max(0.0);
+            let cosine = 0.5 * (1.0 + (std::f64::consts::PI * clamped).cos());
+            let min_lr = self.initial_lr * self.lr_decay_factor;
+            let decayed_lr = min_lr + (self.initial_lr - min_lr) * cosine;
             self.optimizer.set_learning_rate(decayed_lr);
         }
 

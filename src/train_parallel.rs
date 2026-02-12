@@ -19,7 +19,7 @@ use crate::{Features, STATE_DIM};
 pub struct TrainParallelArgs {
     #[arg(long)]
     pub rom: PathBuf,
-    #[arg(long, default_value = "2000000")]
+    #[arg(long, default_value = "5000000")]
     pub timesteps: u64,
     #[arg(long, default_value = "4")]
     pub frame_skip: u32,
@@ -241,7 +241,13 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
     };
     eprintln!("Device: {:?}", device);
 
-    let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
+    let mut agent = DqnAgent::new(
+        &device,
+        AgentConfig {
+            total_timesteps: args.timesteps,
+            ..AgentConfig::default()
+        },
+    )?;
     let mut best_reward = f64::NEG_INFINITY;
     let mut total_steps: u64 = 0;
     let mut episode: u64 = 0;

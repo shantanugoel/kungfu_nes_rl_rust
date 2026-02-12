@@ -1,7 +1,7 @@
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-pub const STATE_DIM: usize = 77;
+pub const STATE_DIM: usize = 84;
 pub type Features = [f32; STATE_DIM];
 
 pub mod dqn;

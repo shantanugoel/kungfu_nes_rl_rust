@@ -64,7 +64,13 @@ fn train(args: &TrainArgs) -> Result<()> {
     } else {
         None
     };
-    let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
+    let mut agent = DqnAgent::new(
+        &device,
+        AgentConfig {
+            total_timesteps: args.timesteps,
+            ..AgentConfig::default()
+        },
+    )?;
 
     std::fs::create_dir_all(&args.checkpoint_dir)?;
 
@@ -744,7 +750,7 @@ struct ExploreArgs {
 struct TrainArgs {
     #[arg(long)]
     rom: PathBuf,
-    #[arg(long, default_value = "2000000")]
+    #[arg(long, default_value = "5000000")]
     timesteps: u64,
     #[arg(long, default_value = "4")]
     frame_skip: u32,

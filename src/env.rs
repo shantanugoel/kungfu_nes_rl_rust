@@ -17,6 +17,7 @@ pub struct RewardConfig {
     pub max_valid_score_delta: i64,
     pub score_divisor: f64,
     pub max_score_reward: f64,
+    pub reward_scale: f64,
     pub hp_damage_multiplier: f64,
     pub hp_delta_sanity_bound: i32,
     pub movement_reward_per_pixel: f64,
@@ -32,19 +33,20 @@ pub struct RewardConfig {
 impl Default for RewardConfig {
     fn default() -> Self {
         Self {
-            energy_damage_multiplier: 2.0,
+            energy_damage_multiplier: 1.0,
             max_valid_score_delta: 5_000,
-            score_divisor: 50.0,
-            max_score_reward: 2.0,
-            hp_damage_multiplier: 0.25,
+            score_divisor: 100.0,
+            max_score_reward: 5.0,
+            reward_scale: 0.1,
+            hp_damage_multiplier: 0.20,
             hp_delta_sanity_bound: -200,
-            movement_reward_per_pixel: 0.1,
+            movement_reward_per_pixel: 0.05,
             max_movement_delta: 128,
             max_valid_movement_delta: 15,
-            floor_completion_bonus: 100.0,
+            floor_completion_bonus: 20.0,
             boss_damage_multiplier: 2.0,
-            time_penalty: -0.001,
-            death_penalty: -100.0,
+            time_penalty: -0.002,
+            death_penalty: -10.0,
             max_energy_drop: 4,
         }
     }
@@ -246,7 +248,7 @@ pub struct RewardBreakdown {
 }
 
 impl GameState {
-    pub fn to_features(&self) -> Features {
+    pub fn to_features_with_prev(&self, prev: Option<&GameState>) -> Features {
         let mut f = [0f32; STATE_DIM];
         let mut idx = 0;
 
@@ -295,6 +297,31 @@ impl GameState {
         }
         f[idx] = self.floor as f32 / 5.0;
         idx += 1;
+        f[idx] = (self.page.min(6) as f32) / 6.0;
+        idx += 1;
+
+        let mut player_dx = 0.0f32;
+        let mut player_dy = 0.0f32;
+        if let Some(prev_state) = prev {
+            let mut dx_raw = self.player_x as f32 - prev_state.player_x as f32;
+            let mut dy_raw = self.player_y as f32 - prev_state.player_y as f32;
+            if dx_raw > 128.0 {
+                dx_raw -= 256.0;
+            } else if dx_raw < -128.0 {
+                dx_raw += 256.0;
+            }
+            if dy_raw > 128.0 {
+                dy_raw -= 256.0;
+            } else if dy_raw < -128.0 {
+                dy_raw += 256.0;
+            }
+            player_dx = dx_raw / 128.0;
+            player_dy = dy_raw / 128.0;
+        }
+        f[idx] = player_dx;
+        idx += 1;
+        f[idx] = player_dy;
+        idx += 1;
 
         #[derive(Clone, Copy)]
         struct EnemyFeatures {
@@ -304,6 +331,7 @@ impl GameState {
             dy: f32,
             enemy_type: [f32; 8],
             facing: f32,
+            energy: f32,
         }
 
         let mut enemies: [EnemyFeatures; 4] = [EnemyFeatures {
@@ -313,6 +341,7 @@ impl GameState {
             dy: 0.0,
             enemy_type: [0.0; 8],
             facing: 0.0,
+            energy: 0.0,
         }; 4];
         for (i, enemy_slot) in enemies.iter_mut().enumerate() {
             if self.enemy_active[i] {
@@ -330,6 +359,11 @@ impl GameState {
                 let mut enemy_type = [0.0f32; 8];
                 let type_idx = (self.enemy_type[i] as usize).min(7);
                 enemy_type[type_idx] = 1.0;
+                let energy = if self.enemy_energy[i] == 0xFF {
+                    0.0
+                } else {
+                    (self.enemy_energy[i].min(4) as f32) / 4.0
+                };
                 *enemy_slot = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
@@ -337,6 +371,7 @@ impl GameState {
                     dy: dy_raw / 128.0,
                     enemy_type,
                     facing,
+                    energy,
                 };
             }
         }
@@ -359,6 +394,8 @@ impl GameState {
                 idx += 1;
             }
             f[idx] = enemy.facing;
+            idx += 1;
+            f[idx] = enemy.energy;
             idx += 1;
         }
 
@@ -430,6 +467,10 @@ impl GameState {
         );
 
         f
+    }
+
+    pub fn to_features(&self) -> Features {
+        self.to_features_with_prev(None)
     }
 
     pub fn global_x(&self) -> i32 {
@@ -861,7 +902,7 @@ impl NesEnv {
         self.progress_start_global_x = self.prev_state.global_x();
         self.progress_best = 0;
 
-        Ok(self.prev_state.to_features())
+        Ok(self.prev_state.to_features_with_prev(None))
     }
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -898,6 +939,7 @@ impl NesEnv {
 
     pub fn step(&mut self, action: Action) -> Result<StepResult> {
         self.steps += 1;
+        let prev_obs_state = self.prev_state.clone();
 
         let effective_action = if self.rng.random::<f64>() < self.env_config.sticky_action_prob {
             self.last_action
@@ -918,7 +960,7 @@ impl NesEnv {
             self.prev_state = state;
             let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
             return Ok(StepResult {
-                state: self.prev_state.to_features(),
+                state: self.prev_state.to_features_with_prev(None),
                 reward: 0.0,
                 done,
                 life_lost: false,
@@ -944,7 +986,8 @@ impl NesEnv {
             {
                 frame_reward += self.reward_config.death_penalty;
                 if self.reward_debug {
-                    self.reward_breakdown.death += self.reward_config.death_penalty;
+                    self.reward_breakdown.death +=
+                        self.reward_config.death_penalty * self.reward_config.reward_scale;
                 }
                 life_lost = true;
                 if state.player_lives == 0 {
@@ -960,13 +1003,14 @@ impl NesEnv {
         }
 
         if playing {
+            frame_reward *= self.reward_config.reward_scale;
             self.total_reward += frame_reward;
         }
 
         let active_enemies = (0..4).filter(|&i| self.prev_state.enemy_active[i]).count() as u8;
 
         Ok(StepResult {
-            state: self.prev_state.to_features(),
+            state: self.prev_state.to_features_with_prev(Some(&prev_obs_state)),
             reward: frame_reward as f32,
             done: life_lost,
             life_lost,
@@ -1057,13 +1101,14 @@ impl NesEnv {
             energy_reward + score_reward + hp_penalty + movement_reward + floor_bonus + boss_reward;
 
         if self.reward_debug {
-            self.reward_breakdown.energy += energy_reward;
-            self.reward_breakdown.score += score_reward;
-            self.reward_breakdown.hp += hp_penalty;
-            self.reward_breakdown.movement += movement_reward;
-            self.reward_breakdown.floor += floor_bonus;
-            self.reward_breakdown.boss += boss_reward;
-            self.reward_breakdown.time += rc.time_penalty;
+            let scale = rc.reward_scale;
+            self.reward_breakdown.energy += energy_reward * scale;
+            self.reward_breakdown.score += score_reward * scale;
+            self.reward_breakdown.hp += hp_penalty * scale;
+            self.reward_breakdown.movement += movement_reward * scale;
+            self.reward_breakdown.floor += floor_bonus * scale;
+            self.reward_breakdown.boss += boss_reward * scale;
+            self.reward_breakdown.time += rc.time_penalty * scale;
         }
 
         reward
