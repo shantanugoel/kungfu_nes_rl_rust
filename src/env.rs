@@ -115,7 +115,7 @@ pub mod ram {
 
     pub const TIMER_DIGITS: [u16; 4] = [0x0390, 0x0391, 0x0392, 0x0393];
 
-    pub const BOSS_HP: Option<u16> = None;
+    pub const BOSS_HP: Option<u16> = Some(0x04A5);
     pub const FLOOR: u16 = 0x005F;
 }
 
@@ -455,7 +455,7 @@ impl GameState {
             idx += 1;
         }
 
-        f[idx] = self.boss_hp as f32 / 255.0;
+        f[idx] = self.boss_hp as f32 / 48.0;
         idx += 1;
         f[idx] = (self.timer.min(9999) as f32) / 9999.0;
         idx += 1;

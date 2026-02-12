@@ -10,6 +10,7 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x00D4` | `PLAYER_X` | 1 | Player horizontal position. | 0-255 (screen-space). |
 | `0x00B6` | `PLAYER_Y` | 1 | Player vertical position. | 0-255 (screen-space). |
 | `0x04A6` | `PLAYER_HP` | 1 | Player health points (see Technical Notes). | 0-48 expected, `0xFF` sentinel during death. |
+| `0x04A5` | `BOSS_HP` | 1 | Same as Player at least on floor 1. | 0-48, `0xFF` sentinel during death. |
 | `0x036E` | `PLAYER_POSE` | 1 | Player pose/animation index. | Changes with actions and movement. |
 | `0x036F` | `PLAYER_STATE` | 1 | Player direction and attack state (see Notes). | Low nibble: direction/stance; high nibble: attack type. |
 | `0x0065` | `PAGE` | 1 | Screen/page number for horizontal scroll. | Increments/decrements on screen transitions. |
@@ -33,7 +34,6 @@ This document tracks the memory addresses used for state extraction in the `kung
 
 | Address | Name | Status | Notes | Potential Values / Meanings |
 | :--- | :--- | :--- | :--- | :--- |
-| `0x0534` | `BOSS_HP` | Conflict | Confirmed as `score_100` digit. Boss HP is likely elsewhere. | If found elsewhere, likely 0-255 decreasing during boss fight. |
 | `0x0050` | `PLAYER_STATE` | To Verify | Legacy placeholder, superseded by `0x036F`. | Remove from code once unused. |
 
 ## Technical Notes
