@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use kungfu_rl_rs::dqn::{save_checkpoint, save_recent_rewards, AgentConfig, DqnAgent, Transition};
-use kungfu_rl_rs::env::{ram, Action, EnvConfig, NesEnv, RewardConfig};
-use kungfu_rl_rs::train_parallel::{self, TrainParallelArgs};
 use kungfu_rl_rs::Features;
+use kungfu_rl_rs::dqn::{AgentConfig, DqnAgent, Transition, save_checkpoint, save_recent_rewards};
+use kungfu_rl_rs::env::{Action, EnvConfig, NesEnv, RewardConfig, ram};
+use kungfu_rl_rs::train_parallel::{self, TrainParallelArgs};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -66,7 +66,7 @@ fn train(args: &TrainArgs) -> Result<()> {
     };
     let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
 
-    std::fs::create_dir_all("checkpoints")?;
+    std::fs::create_dir_all(&args.checkpoint_dir)?;
 
     let mut best_reward = f64::NEG_INFINITY;
     let mut episode: u64 = 0;
@@ -249,9 +249,18 @@ fn train(args: &TrainArgs) -> Result<()> {
         }
 
         if total_steps % 50_000 < ep_steps {
-            agent.save(&format!("checkpoints/step_{total_steps}.safetensors"))?;
-            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-            save_recent_rewards(&recent_rewards, "checkpoints")?;
+            let step_path = args
+                .checkpoint_dir
+                .join(format!("step_{total_steps}.safetensors"));
+            agent.save(&step_path.to_string_lossy())?;
+            save_checkpoint(
+                &agent,
+                best_reward,
+                episode,
+                total_steps,
+                &args.checkpoint_dir,
+            )?;
+            save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
         }
 
         recent_rewards.push_back(ep_reward);
@@ -268,9 +277,16 @@ fn train(args: &TrainArgs) -> Result<()> {
 
         if recent_rewards.len() >= 100 && avg_reward > best_reward {
             best_reward = avg_reward;
-            agent.save("checkpoints/best.safetensors")?;
-            save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-            save_recent_rewards(&recent_rewards, "checkpoints")?;
+            let best_path = args.checkpoint_dir.join("best.safetensors");
+            agent.save(&best_path.to_string_lossy())?;
+            save_checkpoint(
+                &agent,
+                best_reward,
+                episode,
+                total_steps,
+                &args.checkpoint_dir,
+            )?;
+            save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
         }
 
         let elapsed = t_start.elapsed().as_secs_f64();
@@ -314,9 +330,16 @@ fn train(args: &TrainArgs) -> Result<()> {
         last_render_kills = ep_kills;
     }
 
-    agent.save("checkpoints/final.safetensors")?;
-    save_checkpoint(&agent, best_reward, episode, total_steps, "checkpoints")?;
-    save_recent_rewards(&recent_rewards, "checkpoints")?;
+    let final_path = args.checkpoint_dir.join("final.safetensors");
+    agent.save(&final_path.to_string_lossy())?;
+    save_checkpoint(
+        &agent,
+        best_reward,
+        episode,
+        total_steps,
+        &args.checkpoint_dir,
+    )?;
+    save_recent_rewards(&recent_rewards, &args.checkpoint_dir)?;
     eprintln!(
         "\n✅ Training complete. {total_steps} steps in {:.1}s",
         t_start.elapsed().as_secs_f64()
@@ -733,6 +756,8 @@ struct TrainArgs {
     no_clock: bool,
     #[arg(long, default_value_t = false)]
     real_time: bool,
+    #[arg(long, default_value = "checkpoints")]
+    checkpoint_dir: PathBuf,
     #[arg(long)]
     resume: Option<PathBuf>,
 }

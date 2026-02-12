@@ -754,7 +754,9 @@ impl NesEnv {
         self.session_state = SessionState::Startup;
         self.countdown_seen = false;
 
-        let noops = self.rng.random_range(self.env_config.random_noop_range.clone());
+        let noops = self
+            .rng
+            .random_range(self.env_config.random_noop_range.clone());
         for _ in 0..noops {
             self.clock_frame()?;
         }
@@ -770,7 +772,9 @@ impl NesEnv {
             ));
         }
         let mut timeout = 0;
-        while state.player_x > self.env_config.auto_walk_target_x && timeout < self.env_config.auto_walk_timeout_frames {
+        while state.player_x > self.env_config.auto_walk_target_x
+            && timeout < self.env_config.auto_walk_timeout_frames
+        {
             self.clock_frame()?;
             state = self.read_state();
             timeout += 1;

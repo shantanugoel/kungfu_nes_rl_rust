@@ -227,22 +227,19 @@ pub struct TrainMeta {
     pub agent_steps: u64,
 }
 
-pub fn save_checkpoint(
+pub fn save_checkpoint<P: AsRef<Path>>(
     agent: &DqnAgent,
     best_reward: f64,
     episode: u64,
     total_steps: u64,
-    dir: &str,
+    dir: P,
 ) -> Result<()> {
+    let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
-    agent
-        .online_varmap
-        .save(Path::new(dir).join("model.safetensors"))?;
-    agent
-        .target_varmap
-        .save(Path::new(dir).join("target.safetensors"))?;
-    agent.save_optimizer(Path::new(dir).join("optimizer.safetensors"))?;
-    agent.replay.save(Path::new(dir).join("replay.bin"))?;
+    agent.online_varmap.save(dir.join("model.safetensors"))?;
+    agent.target_varmap.save(dir.join("target.safetensors"))?;
+    agent.save_optimizer(dir.join("optimizer.safetensors"))?;
+    agent.replay.save(dir.join("replay.bin"))?;
 
     let meta = TrainMeta {
         best_reward,
@@ -251,16 +248,17 @@ pub fn save_checkpoint(
         epsilon: agent.epsilon,
         agent_steps: agent.steps,
     };
-    let file = File::create(Path::new(dir).join("meta.json"))?;
+    let file = File::create(dir.join("meta.json"))?;
     let writer = std::io::BufWriter::new(file);
     serde_json::to_writer(writer, &meta)?;
     Ok(())
 }
 
-pub fn save_recent_rewards(recent_rewards: &VecDeque<f64>, dir: &str) -> Result<()> {
+pub fn save_recent_rewards<P: AsRef<Path>>(recent_rewards: &VecDeque<f64>, dir: P) -> Result<()> {
+    let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
     let rewards: Vec<f64> = recent_rewards.iter().copied().collect();
-    let file = File::create(Path::new(dir).join("recent_rewards.json"))?;
+    let file = File::create(dir.join("recent_rewards.json"))?;
     let writer = std::io::BufWriter::new(file);
     serde_json::to_writer(writer, &rewards)?;
     Ok(())
