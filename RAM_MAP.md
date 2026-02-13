@@ -8,17 +8,22 @@ This document tracks the memory addresses used for state extraction in the `kung
 | :--- | :--- | :--- | :--- | :--- |
 | `0x005C` | `PLAYER_LIVES` | 1 | Remaining lives. | Typically 0-5 (3 at start). |
 | `0x00D4` | `PLAYER_X` | 1 | Player horizontal position. | 0-255 (screen-space). |
+| `0x00D3` | `BOSS_X` | 1 | Boss horizontal position. | 0-255 (screen-space). |
 | `0x00B6` | `PLAYER_Y` | 1 | Player vertical position. | 0-255 (screen-space). |
+| `0x00B5` | `BOSS_Y` | 1 | Boss vertical position. | 0-255 (screen-space). |
 | `0x04A6` | `PLAYER_HP` | 1 | Player health points (see Technical Notes). | 0-48 expected, `0xFF` sentinel during death. |
 | `0x04A5` | `BOSS_HP` | 1 | Same as Player at least on floor 1. | 0-48, `0xFF` sentinel during death. |
-| `0x036E` | `PLAYER_POSE` | 1 | Player pose/animation index. | Changes with actions and movement. |
+| `0x036E` | `PLAYER_POSE` | 1 | Player pose/animation index. | Changes with actions and movement. Also in 0x0069|
 | `0x036F` | `PLAYER_STATE` | 1 | Player direction and attack state (see Notes). | Low nibble: direction/stance; high nibble: attack type. |
 | `0x0065` | `PAGE` | 1 | Screen/page number for horizontal scroll. | Increments/decrements on screen transitions. |
 | `0x00CE - 0x00D1` | `ENEMY_X` | 4 | X positions for enemy slots 0 through 3. | 0-255 (screen-space). |
 | `0x0087 - 0x008A` | `ENEMY_TYPE` | 4 | Enemy type identifiers for slots 0 through 3. | 0-7 observed (enemy class id). |
 | `0x00B0 - 0x00B3` | `ENEMY_Y` | 4 | Y positions for enemy slots 0 through 3. | 0-255 (screen-space). |
-| `0x00C0 - 0x00C3` | `ENEMY_FACING` | 4 | Facing direction for enemy slots 0 through 3. | 0/1 (L/R). |
-| `0x00DF - 0x00E2` | `ENEMY_POSE` | 4 | Animation/pose state for enemy slots 0 through 3. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x00C0 - 0x00C3` | `ENEMY_FACING` | 4 | Facing direction for enemy slots 0 through 3. | 0/Non-zero (L/R). |
+| `0x00C5` | `BOSS_FACING` | 1 | Facing direction for boss. | 0/Non-zero (L/R). |
+| `0x00DF - 0x00E2` | `ENEMY_POSE` | 4 | Animation state for enemy slots 0 through 3. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x00B7 - 0x00BA` | `ENEMY_ATTACK` | 4 | Attack state for enemy slots 0 through 6. | Nonzero indicates active; `0x7F` seen as inactive. |
+| `0x00BC` | `BOSS_ATTACK` | 1 | Attack state for Boss. | Cycles 0 through 9. |
 | `0x04A0 - 0x04A3` | `ENEMY_ENERGY` | 4 | Enemy energy per slot 0 through 3. | See Enemy Energy Behavior. |
 | `0x03D4 - 0x03D7` | `KNIFE_X` | 4 | Knife projectile X positions for slots 0 through 3. | 0-255; 0 or `0xF9` when off-screen. |
 | `0x03D0 - 0x03D3` | `KNIFE_Y` | 4 | Knife projectile Y positions for slots 0 through 3. | 0-255 (screen-space). |
