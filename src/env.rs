@@ -596,6 +596,7 @@ pub struct NesEnv {
     countdown_seen: bool,
     debug_state: bool,
     reward_debug: bool,
+    debug_move: bool,
     reward_breakdown: RewardBreakdown,
     progress_floor: u8,
     progress_start_global_x: i32,
@@ -626,6 +627,7 @@ impl NesEnv {
 
         let debug_state = Self::debug_state_enabled();
         let reward_debug = Self::debug_reward_enabled();
+        let debug_move = Self::debug_move_enabled();
 
         Ok(Self {
             deck,
@@ -641,6 +643,7 @@ impl NesEnv {
             countdown_seen: false,
             debug_state,
             reward_debug,
+            debug_move,
             reward_breakdown: RewardBreakdown::default(),
             progress_floor: 0,
             progress_start_global_x: 0,
@@ -661,6 +664,13 @@ impl NesEnv {
 
     fn debug_reward_enabled() -> bool {
         match std::env::var("KFM_DEBUG_REWARD") {
+            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    fn debug_move_enabled() -> bool {
+        match std::env::var("KFM_DEBUG_MOVE") {
             Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
             Err(_) => false,
         }
@@ -1162,22 +1172,93 @@ impl NesEnv {
 
         let cur_global_x = cur.global_x();
         if cur.floor != self.progress_floor {
+            if self.debug_move {
+                eprintln!(
+                    "[move] floor change {} -> {} | page={} x=0x{:02X} g={} reset start",
+                    self.progress_floor, cur.floor, cur.page, cur.player_x, cur_global_x
+                );
+            }
             self.progress_floor = cur.floor;
             self.progress_start_global_x = cur_global_x;
             self.progress_best = 0;
         } else {
+            if cur.page == 0 && cur.player_x == 0 {
+                if self.debug_move {
+                    let dir = if cur.floor.is_multiple_of(2) {
+                        "L"
+                    } else {
+                        "R"
+                    };
+                    eprintln!(
+                        "[move] ignore reset | floor={} dir={} | page=0 x=0x00 g={}",
+                        cur.floor, dir, cur_global_x
+                    );
+                }
+                return reward;
+            }
+            let prev_global_x = prev.global_x();
+            let global_dx = (cur_global_x - prev_global_x).abs();
+            if global_dx > rc.max_movement_delta {
+                if self.debug_move {
+                    let dir = if cur.floor.is_multiple_of(2) {
+                        "L"
+                    } else {
+                        "R"
+                    };
+                    eprintln!(
+                        "[move] skip | floor={} dir={} | page={} x=0x{:02X} prev_g={} g={} | global_dx={} > max={}",
+                        cur.floor,
+                        dir,
+                        cur.page,
+                        cur.player_x,
+                        prev_global_x,
+                        cur_global_x,
+                        global_dx,
+                        rc.max_movement_delta,
+                    );
+                }
+                self.progress_best = 0;
+                return reward;
+            }
             let progress = if cur.floor.is_multiple_of(2) {
                 self.progress_start_global_x - cur_global_x
             } else {
                 cur_global_x - self.progress_start_global_x
             };
+            let mut delta_raw = 0;
+            let mut delta_used = 0;
+            let mut reward_added = 0.0;
+            let prev_best = self.progress_best;
             if progress > self.progress_best {
-                let delta_raw = progress - self.progress_best;
-                let delta = delta_raw.min(rc.max_movement_delta);
-                if delta > 0 && delta < rc.max_valid_movement_delta {
-                    movement_reward += delta as f64 * rc.movement_reward_per_pixel;
+                delta_raw = progress - self.progress_best;
+                delta_used = delta_raw.min(rc.max_movement_delta);
+                if delta_used > 0 && delta_used < rc.max_valid_movement_delta {
+                    reward_added = delta_used as f64 * rc.movement_reward_per_pixel;
+                    movement_reward += reward_added;
                 }
                 self.progress_best = progress;
+            }
+            if self.debug_move {
+                let dir = if cur.floor.is_multiple_of(2) {
+                    "L"
+                } else {
+                    "R"
+                };
+                eprintln!(
+                    "[move] floor={} dir={} | page={} x=0x{:02X} g={} start={} progress={} best={} -> {} | delta_raw={} delta_used={} reward_add={:.3}",
+                    cur.floor,
+                    dir,
+                    cur.page,
+                    cur.player_x,
+                    cur_global_x,
+                    self.progress_start_global_x,
+                    progress,
+                    prev_best,
+                    self.progress_best,
+                    delta_raw,
+                    delta_used,
+                    reward_added,
+                );
             }
         }
 
