@@ -108,7 +108,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         );
     }
     let t_start = Instant::now();
-    let mut last_eval_steps: u64 = (total_steps / 100_000) * 100_000;
+    let mut last_eval_steps: u64 = (total_steps / 50_000) * 50_000;
 
     let mut all_time_top_score: u32 = 0;
 
@@ -350,7 +350,7 @@ fn train(args: &TrainArgs) -> Result<()> {
             }
         }
 
-        if total_steps >= last_eval_steps.saturating_add(100_000) {
+        if total_steps >= last_eval_steps.saturating_add(50_000) {
             let eval_stats =
                 run_eval(&agent, args.rom.clone(), args.frame_skip, !args.no_clock, 5)?;
             eprintln!(

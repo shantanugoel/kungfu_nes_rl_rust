@@ -8,10 +8,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::Instant;
 
-use crate::dqn::{AgentConfig, DqnAgent, DqnNet, Transition, save_checkpoint, save_recent_rewards};
+use crate::dqn::{save_checkpoint, save_recent_rewards, AgentConfig, DqnAgent, DqnNet, Transition};
 use crate::env::{Action, EnvConfig, NesEnv, RewardConfig};
 use crate::eval::run_eval;
 use crate::{Features, STATE_DIM};
@@ -328,7 +328,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
     let mut last_log = Instant::now();
     let mut last_sync = Instant::now();
     let mut last_save_steps = 0u64;
-    let mut last_eval_steps: u64 = (total_steps / 100_000) * 100_000;
+    let mut last_eval_steps: u64 = (total_steps / 50_000) * 50_000;
 
     let weight_sync_interval_ms = 2000u128;
     let log_interval_ms = 5000u128;
@@ -465,7 +465,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
             last_log = Instant::now();
         }
 
-        if total_steps >= last_eval_steps.saturating_add(100_000) {
+        if total_steps >= last_eval_steps.saturating_add(50_000) {
             let eval_stats = run_eval(&agent, args.rom.clone(), args.frame_skip, true, 5)?;
             eprintln!(
                 "Eval @ {total_steps} | eps=0 sticky=0 | avgR {:.2} | avgScore {:.0} | avgKills {:.1} | n={}",
