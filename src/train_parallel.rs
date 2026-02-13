@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use crate::dqn::{AgentConfig, DqnAgent, DqnNet, Transition, save_checkpoint, save_recent_rewards};
 use crate::env::{Action, EnvConfig, NesEnv, RewardConfig};
+use crate::eval::run_eval;
 use crate::{Features, STATE_DIM};
 
 #[derive(Parser)]
@@ -249,6 +250,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
         },
     )?;
     let mut best_reward = f64::NEG_INFINITY;
+    let mut best_eval_reward = f64::NEG_INFINITY;
     let mut total_steps: u64 = 0;
     let mut episode: u64 = 0;
 
@@ -326,6 +328,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
     let mut last_log = Instant::now();
     let mut last_sync = Instant::now();
     let mut last_save_steps = 0u64;
+    let mut last_eval_steps: u64 = (total_steps / 100_000) * 100_000;
 
     let weight_sync_interval_ms = 2000u128;
     let log_interval_ms = 5000u128;
@@ -460,6 +463,23 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
             ep_loss = 0.0;
             loss_count = 0;
             last_log = Instant::now();
+        }
+
+        if total_steps >= last_eval_steps.saturating_add(100_000) {
+            let eval_stats = run_eval(&agent, args.rom.clone(), args.frame_skip, true, 5)?;
+            eprintln!(
+                "Eval @ {total_steps} | eps=0 sticky=0 | avgR {:.2} | avgScore {:.0} | avgKills {:.1} | n={}",
+                eval_stats.avg_reward,
+                eval_stats.avg_score,
+                eval_stats.avg_kills,
+                eval_stats.episodes,
+            );
+            if eval_stats.avg_reward > best_eval_reward {
+                best_eval_reward = eval_stats.avg_reward;
+                let best_eval_path = args.checkpoint_dir.join("eval_best.safetensors");
+                agent.save(&best_eval_path.to_string_lossy())?;
+            }
+            last_eval_steps = total_steps;
         }
 
         if total_steps - last_save_steps >= 50_000 {

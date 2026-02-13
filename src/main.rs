@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use kungfu_rl_rs::Features;
 use kungfu_rl_rs::dqn::{AgentConfig, DqnAgent, Transition, save_checkpoint, save_recent_rewards};
 use kungfu_rl_rs::env::{Action, EnvConfig, NesEnv, RewardConfig, ram};
+use kungfu_rl_rs::eval::run_eval;
 use kungfu_rl_rs::train_parallel::{self, TrainParallelArgs};
 use rand::Rng;
 use std::collections::VecDeque;
@@ -86,6 +87,7 @@ fn train(args: &TrainArgs) -> Result<()> {
     std::fs::create_dir_all(&args.checkpoint_dir)?;
 
     let mut best_reward = f64::NEG_INFINITY;
+    let mut best_eval_reward = f64::NEG_INFINITY;
     let mut episode: u64 = 0;
     let mut total_steps: u64 = 0;
     if let Some(resume_dir) = args.resume.as_ref() {
@@ -106,6 +108,7 @@ fn train(args: &TrainArgs) -> Result<()> {
         );
     }
     let t_start = Instant::now();
+    let mut last_eval_steps: u64 = (total_steps / 100_000) * 100_000;
 
     let mut all_time_top_score: u32 = 0;
 
@@ -324,8 +327,16 @@ fn train(args: &TrainArgs) -> Result<()> {
             );
             if env.reward_debug_enabled() {
                 let breakdown = env.reward_breakdown();
+                let total = breakdown.score
+                    + breakdown.hp
+                    + breakdown.death
+                    + breakdown.energy
+                    + breakdown.movement
+                    + breakdown.floor
+                    + breakdown.boss
+                    + breakdown.time;
                 eprintln!(
-                    "  R parts | score {:+.1} | hp {:+.1} | death {:+.1} | energy {:+.1} | move {:+.1} | floor {:+.1} | boss {:+.1} | time {:+.1}",
+                    "  R parts | score {:+.1} | hp {:+.1} | death {:+.1} | energy {:+.1} | move {:+.1} | floor {:+.1} | boss {:+.1} | time {:+.1} | total {:+.1}",
                     breakdown.score,
                     breakdown.hp,
                     breakdown.death,
@@ -334,8 +345,27 @@ fn train(args: &TrainArgs) -> Result<()> {
                     breakdown.floor,
                     breakdown.boss,
                     breakdown.time,
+                    total,
                 );
             }
+        }
+
+        if total_steps >= last_eval_steps.saturating_add(100_000) {
+            let eval_stats =
+                run_eval(&agent, args.rom.clone(), args.frame_skip, !args.no_clock, 5)?;
+            eprintln!(
+                "Eval @ {total_steps} | eps=0 sticky=0 | avgR {:.2} | avgScore {:.0} | avgKills {:.1} | n={}",
+                eval_stats.avg_reward,
+                eval_stats.avg_score,
+                eval_stats.avg_kills,
+                eval_stats.episodes,
+            );
+            if eval_stats.avg_reward > best_eval_reward {
+                best_eval_reward = eval_stats.avg_reward;
+                let best_eval_path = args.checkpoint_dir.join("eval_best.safetensors");
+                agent.save(&best_eval_path.to_string_lossy())?;
+            }
+            last_eval_steps = total_steps;
         }
 
         last_render_ep = episode;
@@ -656,6 +686,10 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
         let _state = env.reset()?;
         let mut total_reward = 0.0;
         let mut steps = 0u64;
+        let mut ep_score = 0u32;
+        let mut prev_score = env.prev_state.score;
+        let mut ep_kills = 0u32;
+        let mut prev_kill_count = env.prev_state.kill_count;
 
         loop {
             env.step_pause()?;
@@ -664,20 +698,30 @@ fn baseline(args: &BaselineArgs) -> Result<()> {
             }
             let action = Action::from_index(rng.random_range(0..Action::COUNT));
             let result = env.step(action)?;
-            total_reward += result.reward as f64;
-            steps += 1;
+            if result.playing {
+                total_reward += result.reward as f64;
+                steps += 1;
 
-            if result.game_over || steps > 10_000 {
+                let kill_delta = result.kills.wrapping_sub(prev_kill_count);
+                if kill_delta > 0 && kill_delta < 10 {
+                    ep_kills += kill_delta as u32;
+                }
+                prev_kill_count = result.kills;
+
+                let score_delta = result.score.saturating_sub(prev_score);
+                ep_score += score_delta;
+                prev_score = result.score;
+            }
+
+            if result.done || steps > 10_000 {
                 break;
             }
         }
 
         eprintln!(
-            "Random ep {}: reward={total_reward:.1}, steps={steps}, score={}, top={}, kills={}",
+            "Random ep {}: reward={total_reward:.1}, steps={steps}, score={ep_score}, top={}, kills={ep_kills}",
             ep + 1,
-            env.prev_state.score,
             env.prev_state.top_score,
-            env.prev_state.kill_count,
         );
         rewards.push(total_reward);
     }

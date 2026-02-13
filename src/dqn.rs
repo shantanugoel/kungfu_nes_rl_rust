@@ -43,7 +43,7 @@ impl Default for AgentConfig {
             dueling_hidden_size: 256,
             gamma: 0.99,
             epsilon_start: 1.0,
-            epsilon_end: 0.02,
+            epsilon_end: 0.01,
             epsilon_decay_steps: 1_000_000,
             tau: 0.005,
             max_grad_norm: 10.0,
