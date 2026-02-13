@@ -38,7 +38,7 @@ impl Default for RewardConfig {
             score_divisor: 100.0,
             max_score_reward: 5.0,
             reward_scale: 0.1,
-            hp_damage_multiplier: 0.40,
+            hp_damage_multiplier: 0.50,
             hp_delta_sanity_bound: -200,
             movement_reward_per_pixel: 0.15,
             max_movement_delta: 128,
@@ -46,7 +46,7 @@ impl Default for RewardConfig {
             floor_completion_bonus: 20.0,
             boss_damage_multiplier: 2.0,
             time_penalty: -0.002,
-            death_penalty: -10.0,
+            death_penalty: -20.0,
             max_energy_drop: 4,
         }
     }
@@ -1170,8 +1170,9 @@ impl NesEnv {
             floor_bonus += rc.floor_completion_bonus;
         }
 
+        let boss_active = cur.boss_active != 0 && cur.boss_active != 0x7F;
         let boss_delta = prev.boss_hp as i32 - cur.boss_hp as i32;
-        if boss_delta > 0 && boss_delta < 200 {
+        if boss_active && boss_delta > 0 && boss_delta < 200 {
             boss_reward += boss_delta as f64 * rc.boss_damage_multiplier;
         }
 

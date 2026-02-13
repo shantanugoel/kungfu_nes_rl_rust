@@ -1,3 +1,4 @@
 /target
 checkpoints/
 *.log
+old_checkpoints/
