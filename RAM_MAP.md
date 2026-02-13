@@ -34,6 +34,7 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x0501 - 0x0506` | `TOP_SCORE_DIGITS` | 6 | BCD-encoded score digits. | Each byte is a single digit 0-9 (low nibble). |
 | `0x0390 - 0x0393` | `TIMER_DIGITS` | 4 | BCD-encoded timer digits. | Four-digit timer (e.g., 1079). |
 | `0x005F` | `FLOOR` | 1 | Tracks the current stage/floor level. | Small integer that increments on floor transition (0-5 or 1-6). |
+| `0x00E4` | `BOSS_ACTIVE` | 1 | Boss is active or not. Use other boss signals based on this. | 0 when not active, 1 when active, 0x7F when died |
 
 ## Unconfirmed / To Verify
 
