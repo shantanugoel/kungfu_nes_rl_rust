@@ -108,7 +108,12 @@ fn train(args: &TrainArgs) -> Result<()> {
         );
     }
     let t_start = Instant::now();
-    let mut last_eval_steps: u64 = (total_steps / 50_000) * 50_000;
+    let eval_interval = args.eval_interval;
+    let mut last_eval_steps: u64 = if eval_interval > 0 {
+        (total_steps / eval_interval) * eval_interval
+    } else {
+        total_steps
+    };
 
     let mut all_time_top_score: u32 = 0;
 
@@ -350,7 +355,7 @@ fn train(args: &TrainArgs) -> Result<()> {
             }
         }
 
-        if total_steps >= last_eval_steps.saturating_add(50_000) {
+        if eval_interval > 0 && total_steps >= last_eval_steps.saturating_add(eval_interval) {
             let eval_stats =
                 run_eval(&agent, args.rom.clone(), args.frame_skip, !args.no_clock, 5)?;
             eprintln!(
@@ -869,6 +874,8 @@ struct TrainArgs {
     checkpoint_dir: PathBuf,
     #[arg(long)]
     resume: Option<PathBuf>,
+    #[arg(long, default_value = "50000")]
+    eval_interval: u64,
 }
 
 #[derive(Parser)]
