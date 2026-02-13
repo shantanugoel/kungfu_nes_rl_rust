@@ -376,7 +376,18 @@ fn play(args: &PlayArgs) -> Result<()> {
     let device = if args.cpu {
         candle_core::Device::Cpu
     } else {
-        candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        #[cfg(target_os = "macos")]
+        {
+            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
+        }
     };
 
     let env_config = EnvConfig {
@@ -425,8 +436,14 @@ fn play(args: &PlayArgs) -> Result<()> {
 
     let mut buf = vec![0u32; 256 * 240];
 
+    let mut state = env.reset()?;
+    let mut need_reset = false;
+
     for ep in 0..args.episodes {
-        let mut state = env.reset()?;
+        if need_reset {
+            state = env.reset()?;
+            need_reset = false;
+        }
         let mut total_reward = 0.0;
         let mut steps = 0u64;
 
@@ -455,7 +472,10 @@ fn play(args: &PlayArgs) -> Result<()> {
             blit_rgba_to_u32(fb, &mut buf);
             window.update_with_buffer(&buf, 256, 240)?;
 
-            if result.game_over || steps > 20_000 || !window.is_open() {
+            if result.done || steps > 20_000 || !window.is_open() {
+                if result.game_over {
+                    need_reset = true;
+                }
                 break;
             }
         }

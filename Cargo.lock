@@ -1087,6 +1087,7 @@ dependencies = [
  "candle-nn",
  "clap",
  "minifb",
+ "objc",
  "rand",
  "serde",
  "serde-big-array",

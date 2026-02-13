@@ -36,7 +36,7 @@ Controls: Arrow keys to move, Z to punch, X to kick, S to start.
 - **Experience replay** - Stores transitions and samples randomly for training
 - **Soft target updates** - Smoothly updates target network (tau=0.005)
 - **Parallel training** - Run multiple environments simultaneously for faster data collection - WIP
-- **Full checkpointing** - Save and resume training with optimizer state, replay buffer, and metadata
+- **Full checkpointing** - Save and resume training with optimizer hyperparameters, replay buffer, and metadata
 - **Custom reward shaping** - Score points, damage enemies, complete floors, beat the boss
 
 ## Command Line Options
@@ -51,6 +51,8 @@ Controls: Arrow keys to move, Z to punch, X to kick, S to start.
 ### Playing
 - `--model` - Path to .safetensors checkpoint file
 - `--episodes` - Number of episodes to play
+- `--frame-skip` - Frames to skip between agent decisions (default: 4)
+- `--epsilon` - Exploration rate during play (default: 0.0)
 
 ## Checkpoints
 
@@ -58,7 +60,7 @@ The trainer saves several files in your checkpoint directory:
 - `best.safetensors` - Best model so far (based on 100-episode average reward)
 - `model.safetensors` - Current online network
 - `target.safetensors` - Target network
-- `optimizer.safetensors` - Optimizer state (needed to resume)
+- `optimizer.json` - Optimizer hyperparameters (needed to resume with the same LR schedule)
 - `replay.bin` - Experience replay buffer (can be large)
 - `meta.json` - Training progress (episode count, epsilon, etc.)
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::{Linear, Module, ParamsAdamW, VarBuilder, VarMap};
+use candle_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -221,6 +221,27 @@ pub struct BatchTensors {
 }
 
 #[derive(Serialize, Deserialize)]
+struct OptimizerState {
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+}
+
+impl From<&ParamsAdamW> for OptimizerState {
+    fn from(params: &ParamsAdamW) -> Self {
+        Self {
+            lr: params.lr,
+            beta1: params.beta1,
+            beta2: params.beta2,
+            eps: params.eps,
+            weight_decay: params.weight_decay,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct TrainMeta {
     pub best_reward: f64,
     pub episode: u64,
@@ -240,7 +261,7 @@ pub fn save_checkpoint<P: AsRef<Path>>(
     std::fs::create_dir_all(dir)?;
     agent.online_varmap.save(dir.join("model.safetensors"))?;
     agent.target_varmap.save(dir.join("target.safetensors"))?;
-    agent.save_optimizer(dir.join("optimizer.safetensors"))?;
+    agent.save_optimizer(dir.join("optimizer.json"))?;
     agent.replay.save(dir.join("replay.bin"))?;
 
     let meta = TrainMeta {
@@ -296,168 +317,37 @@ pub struct DqnAgent {
     pub steps: u64,
     rng: SmallRng,
 }
-
-pub struct AdamW {
-    vars: Vec<VarAdamW>,
-    pub(crate) step_t: usize,
-    pub(crate) params: ParamsAdamW,
+#[cfg(target_os = "macos")]
+fn with_autorelease_pool<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    objc::rc::autoreleasepool(f)
 }
 
-struct VarAdamW {
-    var: Var,
-    first_moment: Var,
-    second_moment: Var,
+#[cfg(not(target_os = "macos"))]
+fn with_autorelease_pool<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    f()
 }
 
-impl AdamW {
-    pub fn new(vars: Vec<Var>, params: ParamsAdamW) -> Result<Self> {
-        let vars = vars
-            .into_iter()
-            .filter(|var| var.dtype().is_float())
-            .map(|var| {
-                let dtype = var.dtype();
-                let shape = var.shape();
-                let device = var.device();
-                let first_moment = Var::zeros(shape, dtype, device)?;
-                let second_moment = Var::zeros(shape, dtype, device)?;
-                Ok(VarAdamW {
-                    var,
-                    first_moment,
-                    second_moment,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            vars,
-            params,
-            step_t: 0,
-        })
+fn clip_gradients(grads: &mut GradStore, vars: &[Var], max_norm: f64) -> Result<()> {
+    if max_norm <= 0.0 {
+        return Ok(());
     }
-
-    pub fn set_learning_rate(&mut self, lr: f64) {
-        self.params.lr = lr;
-    }
-
-    pub fn backward_step(&mut self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<()> {
-        let grads = loss.backward()?;
-        if let Some(max_norm) = max_grad_norm {
-            let mut total_norm_sq = 0f64;
-            for var in self.vars.iter() {
-                if let Some(g) = grads.get(&var.var) {
-                    let norm = g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-                    total_norm_sq += norm;
-                }
-            }
-            let total_norm = total_norm_sq.sqrt();
-            if total_norm > max_norm {
-                let clip_coef = max_norm / (total_norm + 1e-6);
-                self.step_with_clip(&grads, clip_coef)
-            } else {
-                self.step(&grads)
-            }
-        } else {
-            self.step(&grads)
+    let mut total_norm_sq = 0.0f64;
+    for var in vars {
+        if let Some(g) = grads.get(var.as_tensor()) {
+            total_norm_sq += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
         }
     }
-
-    fn step_with_clip(&mut self, grads: &GradStore, clip_coef: f64) -> Result<()> {
-        self.step_t += 1;
-        let lr = self.params.lr;
-        let lambda = self.params.weight_decay;
-        let lr_lambda = lr * lambda;
-        let beta1 = self.params.beta1;
-        let beta2 = self.params.beta2;
-        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
-        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
-        for var in self.vars.iter() {
-            let theta = &var.var;
-            let m = &var.first_moment;
-            let v = &var.second_moment;
-            if let Some(g) = grads.get(theta) {
-                let g = (g * clip_coef)?;
-                let next_m = ((m.as_tensor() * beta1)? + (&g * (1.0 - beta1))?)?;
-                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
-                let m_hat = (&next_m * scale_m)?;
-                let v_hat = (&next_v * scale_v)?;
-                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
-                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
-                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
-                m.set(&next_m)?;
-                v.set(&next_v)?;
-                theta.set(&next_theta)?;
+    let total_norm = total_norm_sq.sqrt();
+    if total_norm > max_norm {
+        let clip_coef = max_norm / (total_norm + 1e-6);
+        for var in vars {
+            if let Some(g) = grads.get(var.as_tensor()) {
+                let clipped = (g * clip_coef)?;
+                grads.insert(var.as_tensor(), clipped);
             }
         }
-        Ok(())
     }
-
-    fn step(&mut self, grads: &GradStore) -> Result<()> {
-        self.step_t += 1;
-        let lr = self.params.lr;
-        let lambda = self.params.weight_decay;
-        let lr_lambda = lr * lambda;
-        let beta1 = self.params.beta1;
-        let beta2 = self.params.beta2;
-        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
-        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
-        for var in self.vars.iter() {
-            let theta = &var.var;
-            let m = &var.first_moment;
-            let v = &var.second_moment;
-            if let Some(g) = grads.get(theta) {
-                let next_m = ((m.as_tensor() * beta1)? + (g * (1.0 - beta1))?)?;
-                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
-                let m_hat = (&next_m * scale_m)?;
-                let v_hat = (&next_v * scale_v)?;
-                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
-                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
-                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
-                m.set(&next_m)?;
-                v.set(&next_v)?;
-                theta.set(&next_theta)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let mut tensors = std::collections::HashMap::new();
-        tensors.insert(
-            "adamw.step_t".to_string(),
-            Tensor::from_slice(&[self.step_t as u32], 1, &Device::Cpu)?,
-        );
-        for (i, var) in self.vars.iter().enumerate() {
-            tensors.insert(
-                format!("adamw.m.{i}"),
-                var.first_moment.as_tensor().detach(),
-            );
-            tensors.insert(
-                format!("adamw.v.{i}"),
-                var.second_moment.as_tensor().detach(),
-            );
-        }
-        candle_core::safetensors::save(&tensors, path.as_ref())?;
-        Ok(())
-    }
-
-    pub fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let tensors = candle_core::safetensors::load(path.as_ref(), &Device::Cpu)?;
-        let step_t = tensors
-            .get("adamw.step_t")
-            .context("Missing adamw.step_t in optimizer state")?
-            .to_vec1::<u32>()?;
-        self.step_t = step_t.first().copied().unwrap_or(0) as usize;
-        for (i, var) in self.vars.iter().enumerate() {
-            let m = tensors
-                .get(&format!("adamw.m.{i}"))
-                .context("Missing adamw.m tensor in optimizer state")?;
-            let v = tensors
-                .get(&format!("adamw.v.{i}"))
-                .context("Missing adamw.v tensor in optimizer state")?;
-            var.first_moment.set(m)?;
-            var.second_moment.set(v)?;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 impl DqnAgent {
@@ -511,7 +401,7 @@ impl DqnAgent {
     pub fn resume_from(&mut self, resume_dir: &Path) -> Result<(TrainMeta, ReplayBuffer)> {
         let model_path = resume_dir.join("model.safetensors");
         let target_path = resume_dir.join("target.safetensors");
-        let optimizer_path = resume_dir.join("optimizer.safetensors");
+        let optimizer_path = resume_dir.join("optimizer.json");
         let replay_bin_path = resume_dir.join("replay.bin");
         let meta_path = resume_dir.join("meta.json");
 
@@ -559,74 +449,79 @@ impl DqnAgent {
 
     /// Train on a batch from replay buffer (Double DQN)
     pub fn train_step(&mut self) -> Result<f32> {
-        if self.replay.len() < self.learn_start {
-            return Ok(0.0);
-        }
-        self.steps += 1;
-        if !self.steps.is_multiple_of(self.train_freq) {
-            return Ok(0.0);
-        }
+        with_autorelease_pool(|| {
+            if self.replay.len() < self.learn_start {
+                return Ok(0.0);
+            }
+            self.steps += 1;
+            if !self.steps.is_multiple_of(self.train_freq) {
+                return Ok(0.0);
+            }
 
-        let batch = self
-            .replay
-            .sample(self.batch_size, &self.device, &mut self.rng)?;
+            let batch = self
+                .replay
+                .sample(self.batch_size, &self.device, &mut self.rng)?;
 
-        // Online net: Q(s, a) for the actions we actually took
-        let q_all = self.online_net.forward(&batch.states)?;
-        let actions_unsqueezed = batch.actions.unsqueeze(1)?;
-        let q_values = q_all.gather(&actions_unsqueezed, 1)?.squeeze(1)?;
+            // Online net: Q(s, a) for the actions we actually took
+            let q_all = self.online_net.forward(&batch.states)?;
+            let actions_unsqueezed = batch.actions.unsqueeze(1)?;
+            let q_values = q_all.gather(&actions_unsqueezed, 1)?.squeeze(1)?;
 
-        // Double DQN: use online net to SELECT best action, target net to EVALUATE
-        let next_q_online = self.online_net.forward(&batch.next_states)?;
-        let best_next_actions = next_q_online.argmax(candle_core::D::Minus1)?.unsqueeze(1)?;
+            // Double DQN: use online net to SELECT best action, target net to EVALUATE
+            let next_q_online = self.online_net.forward(&batch.next_states)?;
+            let best_next_actions = next_q_online.argmax(candle_core::D::Minus1)?.unsqueeze(1)?;
 
-        let next_q_target = self.target_net.forward(&batch.next_states)?;
-        let next_q = next_q_target
-            .gather(&best_next_actions.to_dtype(DType::I64)?, 1)?
-            .squeeze(1)?;
+            let next_q_target = self.target_net.forward(&batch.next_states)?;
+            let next_q = next_q_target
+                .gather(&best_next_actions.to_dtype(DType::I64)?, 1)?
+                .squeeze(1)?;
 
-        // Target: r + gamma * Q_target(s', argmax_a Q_online(s', a)) * (1 - done)
-        let discounted = next_q.affine(self.gamma, 0.0)?;
-        let target = batch.rewards.add(&discounted.mul(&batch.not_dones)?)?;
+            // Target: r + gamma * Q_target(s', argmax_a Q_online(s', a)) * (1 - done)
+            let discounted = next_q.affine(self.gamma, 0.0)?;
+            let target = batch.rewards.add(&discounted.mul(&batch.not_dones)?)?;
 
-        // Huber loss (smooth L1) — more robust than MSE for RL
-        let diff = q_values.sub(&target.detach())?;
-        let abs_diff = diff.abs()?;
-        let ones = Tensor::ones_like(&abs_diff)?;
-        // Huber: where |d| < 1: 0.5*d^2, else |d| - 0.5
-        let loss = abs_diff
-            .lt(&ones)?
-            .where_cond(
-                &(diff.sqr()?.affine(0.5, 0.0)?),
-                &(abs_diff.affine(1.0, -0.5)?),
-            )?
-            .mean_all()?;
+            // Huber loss (smooth L1) — more robust than MSE for RL
+            let diff = q_values.sub(&target.detach())?;
+            let abs_diff = diff.abs()?;
+            let ones = Tensor::ones_like(&abs_diff)?;
+            // Huber: where |d| < 1: 0.5*d^2, else |d| - 0.5
+            let loss = abs_diff
+                .lt(&ones)?
+                .where_cond(
+                    &(diff.sqr()?.affine(0.5, 0.0)?),
+                    &(abs_diff.affine(1.0, -0.5)?),
+                )?
+                .mean_all()?;
 
-        // Backprop with gradient clipping
-        self.optimizer
-            .backward_step(&loss, Some(self.max_grad_norm))?;
+            // Backprop with gradient clipping
+            let mut grads = loss.backward()?;
+            let vars = self.online_varmap.all_vars();
+            clip_gradients(&mut grads, &vars, self.max_grad_norm)?;
+            self.optimizer.step(&grads)?;
 
-        // Soft update target network every gradient step
-        self.soft_update_target()?;
+            // Soft update target network every gradient step
+            self.soft_update_target()?;
 
-        // Linear epsilon decay based on total env steps
-        let progress = (self.total_env_steps as f64) / (self.epsilon_decay_steps as f64);
-        self.epsilon =
-            self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
+            // Linear epsilon decay based on total env steps
+            let progress = (self.total_env_steps as f64) / (self.epsilon_decay_steps as f64);
+            self.epsilon =
+                self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress.min(1.0);
 
-        // Cosine LR decay after lr_decay_start steps
-        if self.total_env_steps >= self.lr_decay_start && self.total_timesteps > self.lr_decay_start
-        {
-            let progress = (self.total_env_steps - self.lr_decay_start) as f64
-                / (self.total_timesteps - self.lr_decay_start) as f64;
-            let clamped = progress.clamp(0.0, 1.0);
-            let cosine = 0.5 * (1.0 + (std::f64::consts::PI * clamped).cos());
-            let min_lr = self.initial_lr * self.lr_decay_factor;
-            let decayed_lr = min_lr + (self.initial_lr - min_lr) * cosine;
-            self.optimizer.set_learning_rate(decayed_lr);
-        }
+            // Cosine LR decay after lr_decay_start steps
+            if self.total_env_steps >= self.lr_decay_start
+                && self.total_timesteps > self.lr_decay_start
+            {
+                let progress = (self.total_env_steps - self.lr_decay_start) as f64
+                    / (self.total_timesteps - self.lr_decay_start) as f64;
+                let clamped = progress.clamp(0.0, 1.0);
+                let cosine = 0.5 * (1.0 + (std::f64::consts::PI * clamped).cos());
+                let min_lr = self.initial_lr * self.lr_decay_factor;
+                let decayed_lr = min_lr + (self.initial_lr - min_lr) * cosine;
+                self.optimizer.set_learning_rate(decayed_lr);
+            }
 
-        loss.to_scalar::<f32>().map_err(Into::into)
+            loss.to_scalar::<f32>().map_err(Into::into)
+        })
     }
 
     /// Copy online weights → target (hard copy)
@@ -692,10 +587,30 @@ impl DqnAgent {
     }
 
     pub fn save_optimizer<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.optimizer.save_state(path)
+        let state = OptimizerState::from(self.optimizer.params());
+        let file = File::create(path.as_ref())?;
+        let writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(writer, &state)?;
+        Ok(())
     }
 
     pub fn load_optimizer<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        self.optimizer.load_state(path)
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(());
+        }
+        let file = File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let state: OptimizerState =
+            serde_json::from_reader(reader).context("Failed to parse optimizer state")?;
+        let params = ParamsAdamW {
+            lr: state.lr,
+            beta1: state.beta1,
+            beta2: state.beta2,
+            eps: state.eps,
+            weight_decay: state.weight_decay,
+        };
+        self.optimizer.set_params(params);
+        Ok(())
     }
 }
