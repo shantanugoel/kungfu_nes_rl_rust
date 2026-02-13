@@ -613,14 +613,8 @@ impl NesEnv {
     ) -> Result<Self> {
         let mut deck = ControlDeck::new();
         let headless_mode = if headless {
-            // NOTE: We only set NO_AUDIO, not NO_VIDEO.
-            // There appears to be a bug in tetanes-core 0.12.x where setting NO_VIDEO
-            // causes the emulator to hang in headless mode. The PPU frame number
-            // doesn't advance properly, causing clock_frame() to loop forever.
-            // Since we're already getting significant speedup from skipping audio
-            // (which is the more expensive operation), we skip NO_VIDEO for now.
-            // See: https://github.com/lukexor/tetanes/issues
             tetanes_core::control_deck::HeadlessMode::NO_AUDIO
+                | tetanes_core::control_deck::HeadlessMode::NO_VIDEO
         } else {
             tetanes_core::control_deck::HeadlessMode::empty()
         };
