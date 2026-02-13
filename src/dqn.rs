@@ -545,6 +545,13 @@ impl DqnAgent {
         }
     }
 
+    pub fn q_values(&self, state: &[f32]) -> Result<Vec<f32>> {
+        let s = Tensor::from_slice(state, (1, STATE_DIM), &self.device)?;
+        let q = self.online_net.forward(&s)?;
+        let q_vals = q.squeeze(0)?.to_vec1::<f32>()?;
+        Ok(q_vals)
+    }
+
     /// Store transition in replay buffer
     pub fn remember(&mut self, t: Transition) {
         self.replay.push(t);
@@ -612,7 +619,7 @@ impl DqnAgent {
         {
             let progress = (self.total_env_steps - self.lr_decay_start) as f64
                 / (self.total_timesteps - self.lr_decay_start) as f64;
-            let clamped = progress.min(1.0).max(0.0);
+            let clamped = progress.clamp(0.0, 1.0);
             let cosine = 0.5 * (1.0 + (std::f64::consts::PI * clamped).cos());
             let min_lr = self.initial_lr * self.lr_decay_factor;
             let decayed_lr = min_lr + (self.initial_lr - min_lr) * cosine;

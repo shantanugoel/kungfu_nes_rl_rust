@@ -380,7 +380,8 @@ fn play(args: &PlayArgs) -> Result<()> {
     };
 
     let env_config = EnvConfig {
-        sticky_action_prob: 0.0,
+        frame_skip: args.frame_skip,
+        sticky_action_prob: args.sticky_action_prob,
         ..Default::default()
     };
     let mut env = NesEnv::new(args.rom.clone(), false, env_config, RewardConfig::default())?;
@@ -388,7 +389,27 @@ fn play(args: &PlayArgs) -> Result<()> {
     env.set_real_time(args.real_time);
     let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
     agent.load(&args.model.to_string_lossy())?;
-    agent.epsilon = 0.0;
+    agent.epsilon = args.epsilon;
+    if args.dump_weights {
+        let data = agent
+            .online_varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock varmap for diagnostics"))?;
+        eprintln!("Loaded model weight summary:");
+        for (name, var) in data.iter() {
+            let t = var.as_tensor();
+            let mean_t = t.mean_all()?;
+            let mean = mean_t.to_scalar::<f32>()?;
+            let centered = t.broadcast_sub(&mean_t)?;
+            let variance_t = centered.sqr()?.mean_all()?;
+            let std = variance_t.sqrt()?.to_scalar::<f32>()?;
+            eprintln!(
+                "  {name}: shape={:?}, mean={mean:.6}, std={std:.6}",
+                t.shape()
+            );
+        }
+    }
 
     let mut window = minifb::Window::new(
         "Kung Fu Master — RL Agent",
@@ -416,6 +437,13 @@ fn play(args: &PlayArgs) -> Result<()> {
                 continue;
             }
             let action_idx = agent.select_action(&state)?;
+            if args.q_log_interval > 0 && steps.is_multiple_of(args.q_log_interval) {
+                let q_vals = agent.q_values(&state)?;
+                eprintln!(
+                    "Step {steps} | Q-values: {:?} | Chosen: {action_idx}",
+                    q_vals
+                );
+            }
             let result = env.step(Action::from_index(action_idx))?;
             if result.playing {
                 total_reward += result.reward as f64;
@@ -787,6 +815,16 @@ struct PlayArgs {
     model: PathBuf,
     #[arg(long, default_value = "5")]
     episodes: usize,
+    #[arg(long, default_value = "0.0")]
+    epsilon: f64,
+    #[arg(long, default_value_t = false)]
+    dump_weights: bool,
+    #[arg(long, default_value = "0")]
+    q_log_interval: u64,
+    #[arg(long, default_value = "4")]
+    frame_skip: u32,
+    #[arg(long, default_value = "0.25")]
+    sticky_action_prob: f64,
     #[arg(long, default_value_t = false)]
     cpu: bool,
     #[arg(long, default_value_t = false)]
