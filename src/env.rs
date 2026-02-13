@@ -559,7 +559,9 @@ impl GameState {
     }
 
     pub fn global_x(&self) -> i32 {
-        (self.page as i32) * 256 + self.player_x as i32
+        let x = self.player_x as i32;
+        let signed_x = if x >= 0x80 { x - 256 } else { x };
+        (self.page as i32) * 256 + signed_x
     }
 }
 
@@ -1170,11 +1172,12 @@ impl NesEnv {
                 cur_global_x - self.progress_start_global_x
             };
             if progress > self.progress_best {
-                let delta = (progress - self.progress_best).min(rc.max_movement_delta);
+                let delta_raw = progress - self.progress_best;
+                let delta = delta_raw.min(rc.max_movement_delta);
                 if delta > 0 && delta < rc.max_valid_movement_delta {
                     movement_reward += delta as f64 * rc.movement_reward_per_pixel;
-                    self.progress_best = progress;
                 }
+                self.progress_best = progress;
             }
         }
 
