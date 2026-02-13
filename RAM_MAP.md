@@ -35,6 +35,7 @@ This document tracks the memory addresses used for state extraction in the `kung
 | `0x0390 - 0x0393` | `TIMER_DIGITS` | 4 | BCD-encoded timer digits. | Four-digit timer (e.g., 1079). |
 | `0x005F` | `FLOOR` | 1 | Tracks the current stage/floor level. | Small integer that increments on floor transition (0-5 or 1-6). |
 | `0x00E4` | `BOSS_ACTIVE` | 1 | Boss is active or not. Use other boss signals based on this. | 0 when not active, 1 when active, 0x7F when died |
+| `0x373`  | `SHRUG_COUNTER` | 1 | Enemies (grabbers) hugging the player | Count of how many enemies are hugging the players right now, so can be between 0 to 4 |
 
 ## Unconfirmed / To Verify
 
