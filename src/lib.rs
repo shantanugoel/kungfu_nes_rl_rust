@@ -1,6 +1,4 @@
-extern crate accelerate_src;
-
-pub const STATE_DIM: usize = 84;
+pub const STATE_DIM: usize = 98;
 pub type Features = [f32; STATE_DIM];
 
 pub mod dqn;

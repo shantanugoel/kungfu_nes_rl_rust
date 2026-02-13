@@ -38,9 +38,9 @@ impl Default for RewardConfig {
             score_divisor: 100.0,
             max_score_reward: 5.0,
             reward_scale: 0.1,
-            hp_damage_multiplier: 0.20,
+            hp_damage_multiplier: 0.40,
             hp_delta_sanity_bound: -200,
-            movement_reward_per_pixel: 0.05,
+            movement_reward_per_pixel: 0.15,
             max_movement_delta: 128,
             max_valid_movement_delta: 15,
             floor_completion_bonus: 20.0,
@@ -88,6 +88,8 @@ pub mod ram {
     pub const PLAYER_LIVES: u16 = 0x005C;
     pub const PLAYER_X: u16 = 0x00D4;
     pub const PLAYER_Y: u16 = 0x00B6;
+    pub const BOSS_X: u16 = 0x00D3;
+    pub const BOSS_Y: u16 = 0x00B5;
     pub const PLAYER_HP: u16 = 0x04A6;
     pub const PLAYER_POSE: u16 = 0x036E;
     pub const PLAYER_STATE: u16 = 0x036F;
@@ -98,13 +100,18 @@ pub mod ram {
     pub const ENEMY_X: [u16; 4] = [0x00CE, 0x00CF, 0x00D0, 0x00D1];
     pub const ENEMY_TYPE: [u16; 4] = [0x0087, 0x0088, 0x0089, 0x008A];
     pub const ENEMY_Y: [u16; 4] = [0x00B0, 0x00B1, 0x00B2, 0x00B3];
+    pub const ENEMY_ATTACK: [u16; 4] = [0x00B7, 0x00B8, 0x00B9, 0x00BA];
     pub const ENEMY_FACING: [u16; 4] = [0x00C0, 0x00C1, 0x00C2, 0x00C3];
+    pub const BOSS_FACING: u16 = 0x00C5;
     pub const ENEMY_POSE: [u16; 4] = [0x00DF, 0x00E0, 0x00E1, 0x00E2];
+    pub const BOSS_ATTACK: u16 = 0x00BC;
+    pub const BOSS_ACTIVE: u16 = 0x00E4;
     pub const ENEMY_ENERGY: [u16; 4] = [0x04A0, 0x04A1, 0x04A2, 0x04A3];
 
     pub const KNIFE_X: [u16; 4] = [0x03D4, 0x03D5, 0x03D6, 0x03D7];
     pub const KNIFE_Y: [u16; 4] = [0x03D0, 0x03D1, 0x03D2, 0x03D3];
     pub const KNIFE_STATE: [u16; 4] = [0x03EC, 0x03ED, 0x03EE, 0x03EF];
+    pub const KNIFE_THROW_SEQ: [u16; 4] = [0x03F0, 0x03F1, 0x03F2, 0x03F3];
 
     pub const KILL_COUNTER: u16 = 0x03B1;
 
@@ -214,6 +221,7 @@ pub struct GameState {
     pub player_hp: u8,
     pub player_lives: u8,
     pub player_state: u8,
+    pub player_pose: u8,
     pub page: u8,
     pub game_mode: u8,
     pub start_timer: u8,
@@ -226,10 +234,17 @@ pub struct GameState {
     pub enemy_facing: [u8; 4],
     pub enemy_active: [bool; 4],
     pub enemy_energy: [u8; 4],
+    pub enemy_attack: [u8; 4],
     pub knife_x: [u8; 4],
     pub knife_y: [u8; 4],
     pub knife_facing: [u8; 4],
     pub knife_active: [bool; 4],
+    pub knife_throw_seq: [u8; 4],
+    pub boss_x: u8,
+    pub boss_y: u8,
+    pub boss_facing: u8,
+    pub boss_attack: u8,
+    pub boss_active: u8,
     pub boss_hp: u8,
     pub floor: u8,
     pub timer: u16,
@@ -295,6 +310,8 @@ impl GameState {
             f[idx] = v;
             idx += 1;
         }
+        f[idx] = self.player_pose as f32 / 255.0;
+        idx += 1;
         f[idx] = self.floor as f32 / 5.0;
         idx += 1;
         f[idx] = (self.page.min(6) as f32) / 6.0;
@@ -332,6 +349,7 @@ impl GameState {
             enemy_type: [f32; 8],
             facing: f32,
             energy: f32,
+            attack: f32,
         }
 
         let mut enemies: [EnemyFeatures; 4] = [EnemyFeatures {
@@ -342,6 +360,7 @@ impl GameState {
             enemy_type: [0.0; 8],
             facing: 0.0,
             energy: 0.0,
+            attack: 0.0,
         }; 4];
         for (i, enemy_slot) in enemies.iter_mut().enumerate() {
             if self.enemy_active[i] {
@@ -364,6 +383,12 @@ impl GameState {
                 } else {
                     (self.enemy_energy[i].min(4) as f32) / 4.0
                 };
+                let attack_raw = self.enemy_attack[i];
+                let attack = if attack_raw == 0 || attack_raw == 0x7F {
+                    0.0
+                } else {
+                    (attack_raw.min(0x0F) as f32) / 15.0
+                };
                 *enemy_slot = EnemyFeatures {
                     sort_key: abs_dx,
                     active: 1.0,
@@ -372,6 +397,7 @@ impl GameState {
                     enemy_type,
                     facing,
                     energy,
+                    attack,
                 };
             }
         }
@@ -397,6 +423,8 @@ impl GameState {
             idx += 1;
             f[idx] = enemy.energy;
             idx += 1;
+            f[idx] = enemy.attack;
+            idx += 1;
         }
 
         #[derive(Clone, Copy)]
@@ -406,6 +434,7 @@ impl GameState {
             dx: f32,
             dy: f32,
             facing: f32,
+            throw_seq: f32,
         }
 
         let mut knives: [KnifeFeatures; 4] = [KnifeFeatures {
@@ -414,6 +443,7 @@ impl GameState {
             dx: 0.0,
             dy: 0.0,
             facing: 0.0,
+            throw_seq: 0.0,
         }; 4];
 
         for (i, knife_slot) in knives.iter_mut().enumerate() {
@@ -421,6 +451,7 @@ impl GameState {
                 let mut dx_raw = self.knife_x[i] as f32 - self.player_x as f32;
                 let dy_raw = self.knife_y[i] as f32 - self.player_y as f32;
                 let facing = if self.knife_facing[i] == 0 { 0.0 } else { 1.0 };
+                let throw_seq = (self.knife_throw_seq[i].min(3) as f32) / 3.0;
 
                 if dx_raw > 128.0 {
                     dx_raw -= 256.0;
@@ -434,6 +465,7 @@ impl GameState {
                     dx: dx_raw / 128.0,
                     dy: dy_raw / 128.0,
                     facing,
+                    throw_seq,
                 };
             }
         }
@@ -453,9 +485,53 @@ impl GameState {
             idx += 1;
             f[idx] = knife.facing;
             idx += 1;
+            f[idx] = knife.throw_seq;
+            idx += 1;
         }
 
-        f[idx] = self.boss_hp as f32 / 48.0;
+        let boss_active = self.boss_active != 0 && self.boss_active != 0x7F;
+        let boss_active_f = if boss_active { 1.0 } else { 0.0 };
+        let mut boss_dx = 0.0;
+        let mut boss_dy = 0.0;
+        let mut boss_facing = 0.0;
+        let mut boss_attack = 0.0;
+        let mut boss_hp = 0.0;
+        if boss_active {
+            let mut dx_raw = self.boss_x as f32 - self.player_x as f32;
+            let mut dy_raw = self.boss_y as f32 - self.player_y as f32;
+            if dx_raw > 128.0 {
+                dx_raw -= 256.0;
+            } else if dx_raw < -128.0 {
+                dx_raw += 256.0;
+            }
+            if dy_raw > 128.0 {
+                dy_raw -= 256.0;
+            } else if dy_raw < -128.0 {
+                dy_raw += 256.0;
+            }
+            boss_dx = dx_raw / 128.0;
+            boss_dy = dy_raw / 128.0;
+            boss_facing = if self.boss_facing == 0 { 0.0 } else { 1.0 };
+            boss_attack = (self.boss_attack.min(9) as f32) / 9.0;
+            let raw_hp = if self.boss_hp == 0xFF {
+                0
+            } else {
+                self.boss_hp.min(48)
+            };
+            boss_hp = raw_hp as f32 / 48.0;
+        }
+
+        f[idx] = boss_active_f;
+        idx += 1;
+        f[idx] = boss_dx;
+        idx += 1;
+        f[idx] = boss_dy;
+        idx += 1;
+        f[idx] = boss_facing;
+        idx += 1;
+        f[idx] = boss_attack;
+        idx += 1;
+        f[idx] = boss_hp;
         idx += 1;
         f[idx] = (self.timer.min(9999) as f32) / 9999.0;
         idx += 1;
@@ -800,6 +876,7 @@ impl NesEnv {
             player_hp: self.peek(ram::PLAYER_HP),
             player_lives: self.peek(ram::PLAYER_LIVES),
             player_state: self.peek(ram::PLAYER_STATE),
+            player_pose: self.peek(ram::PLAYER_POSE),
             page: self.peek(ram::PAGE),
             game_mode: self.peek(ram::GAME_MODE),
             start_timer: self.peek(ram::START_TIMER),
@@ -809,6 +886,11 @@ impl NesEnv {
                 .map(|digits| self.read_score_digits(digits))
                 .unwrap_or(0),
             kill_count: self.peek(ram::KILL_COUNTER),
+            boss_x: self.peek(ram::BOSS_X),
+            boss_y: self.peek(ram::BOSS_Y),
+            boss_facing: self.peek(ram::BOSS_FACING),
+            boss_attack: self.peek(ram::BOSS_ATTACK),
+            boss_active: self.peek(ram::BOSS_ACTIVE),
             boss_hp: ram::BOSS_HP.map(|addr| self.peek(addr)).unwrap_or(0),
             floor: self.peek(ram::FLOOR),
             timer: self.read_timer(),
@@ -823,6 +905,7 @@ impl NesEnv {
             let pose = self.peek(ram::ENEMY_POSE[i]);
             state.enemy_active[i] = pose != 0 && pose != 0x7F;
             state.enemy_energy[i] = self.peek(ram::ENEMY_ENERGY[i]);
+            state.enemy_attack[i] = self.peek(ram::ENEMY_ATTACK[i]);
 
             state.knife_x[i] = self.peek(ram::KNIFE_X[i]);
             state.knife_y[i] = self.peek(ram::KNIFE_Y[i]);
@@ -833,6 +916,7 @@ impl NesEnv {
                 0x01 => 0,
                 _ => 0,
             };
+            state.knife_throw_seq[i] = self.peek(ram::KNIFE_THROW_SEQ[i]);
         }
         state
     }

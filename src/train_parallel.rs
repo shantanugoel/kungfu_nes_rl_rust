@@ -8,10 +8,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::Instant;
 
-use crate::dqn::{AgentConfig, DqnAgent, DqnNet, Transition, save_checkpoint, save_recent_rewards};
+use crate::dqn::{save_checkpoint, save_recent_rewards, AgentConfig, DqnAgent, DqnNet, Transition};
 use crate::env::{Action, EnvConfig, NesEnv, RewardConfig};
 use crate::{Features, STATE_DIM};
 
