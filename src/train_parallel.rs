@@ -34,6 +34,8 @@ pub struct TrainParallelArgs {
     pub resume: Option<PathBuf>,
     #[arg(long, default_value = "50000")]
     pub eval_interval: u64,
+    #[arg(long, default_value = "10")]
+    pub eval_episodes: usize,
 }
 
 struct WeightSnapshot {
@@ -331,6 +333,7 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
     let mut last_sync = Instant::now();
     let mut last_save_steps = 0u64;
     let eval_interval = args.eval_interval;
+    let eval_episodes = args.eval_episodes;
     let mut last_eval_steps: u64 = if eval_interval > 0 {
         (total_steps / eval_interval) * eval_interval
     } else {
@@ -473,7 +476,13 @@ pub fn train_parallel(args: &TrainParallelArgs) -> Result<()> {
         }
 
         if eval_interval > 0 && total_steps >= last_eval_steps.saturating_add(eval_interval) {
-            let eval_stats = run_eval(&agent, args.rom.clone(), args.frame_skip, true, 5)?;
+            let eval_stats = run_eval(
+                &agent,
+                args.rom.clone(),
+                args.frame_skip,
+                true,
+                eval_episodes,
+            )?;
             eprintln!(
                 "Eval @ {total_steps} | eps=0 sticky=0 | avgR {:.2} | avgScore {:.0} | avgKills {:.1} | n={}",
                 eval_stats.avg_reward,

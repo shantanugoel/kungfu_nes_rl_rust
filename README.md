@@ -4,7 +4,7 @@ A reinforcement learning agent that learns to play Kung Fu Master on the NES usi
 
 ## What This Is
 
-This is a DQN implementation in Rust that plays Kung Fu Master (also known as Spartan X). The agent learns by reading game state directly from the NES RAM - no screen capture needed. It extracts player position, enemy positions, HP, score, and other features to build an 84-dimensional state representation.
+This is a DQN implementation in Rust that plays Kung Fu Master (also known as Spartan X). The agent learns by reading game state directly from the NES RAM - no screen capture needed. It extracts player position, enemy positions, HP, score, and other features to build a 98-dimensional state representation.
 
 The agent outputs 13 actions: noop, movement (left/right/crouch/jump), and punch/kick combinations in different directions.
 
@@ -47,6 +47,8 @@ Controls: Arrow keys to move, Z to punch, X to kick, S to start.
 - `--render` - Show the game window during training
 - `--cpu` - Force CPU-only mode (useful on macOS if Metal causes memory issues)
 - `--checkpoint-dir` - Where to save model checkpoints
+- `--eval-interval` - Run greedy eval every N steps (default: 50,000; 0 disables)
+- `--eval-episodes` - Episodes per eval run (default: 10)
 
 ### Playing
 - `--model` - Path to .safetensors checkpoint file
@@ -57,7 +59,8 @@ Controls: Arrow keys to move, Z to punch, X to kick, S to start.
 ## Checkpoints
 
 The trainer saves several files in your checkpoint directory:
-- `best.safetensors` - Best model so far (based on 100-episode average reward)
+- `best.safetensors` - Best model so far (based on 100-episode average reward during training)
+- `eval_best.safetensors` - Best model so far (based on periodic greedy eval)
 - `model.safetensors` - Current online network
 - `target.safetensors` - Target network
 - `optimizer.json` - Optimizer hyperparameters (needed to resume with the same LR schedule)
@@ -68,7 +71,7 @@ You can resume training from any checkpoint with `--resume <directory>`.
 
 ## Architecture
 
-The neural network takes 84 input features and outputs Q-values for 13 actions:
+The neural network takes 98 input features and outputs Q-values for 13 actions:
 - Player position, HP, facing direction, stance
 - Enemy positions (up to 4), types, energy levels
 - Knife projectiles

@@ -109,6 +109,7 @@ fn train(args: &TrainArgs) -> Result<()> {
     }
     let t_start = Instant::now();
     let eval_interval = args.eval_interval;
+    let eval_episodes = args.eval_episodes;
     let mut last_eval_steps: u64 = if eval_interval > 0 {
         (total_steps / eval_interval) * eval_interval
     } else {
@@ -356,8 +357,13 @@ fn train(args: &TrainArgs) -> Result<()> {
         }
 
         if eval_interval > 0 && total_steps >= last_eval_steps.saturating_add(eval_interval) {
-            let eval_stats =
-                run_eval(&agent, args.rom.clone(), args.frame_skip, !args.no_clock, 5)?;
+            let eval_stats = run_eval(
+                &agent,
+                args.rom.clone(),
+                args.frame_skip,
+                !args.no_clock,
+                eval_episodes,
+            )?;
             eprintln!(
                 "Eval @ {total_steps} | eps=0 sticky=0 | avgR {:.2} | avgScore {:.0} | avgKills {:.1} | n={}",
                 eval_stats.avg_reward,
@@ -876,6 +882,8 @@ struct TrainArgs {
     resume: Option<PathBuf>,
     #[arg(long, default_value = "50000")]
     eval_interval: u64,
+    #[arg(long, default_value = "10")]
+    eval_episodes: usize,
 }
 
 #[derive(Parser)]
