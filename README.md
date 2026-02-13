@@ -4,7 +4,7 @@ A reinforcement learning agent that learns to play Kung Fu Master on the NES usi
 
 ## What This Is
 
-This is a DQN implementation in Rust that plays Kung Fu Master (also known as Spartan X). The agent learns by reading game state directly from the NES RAM - no screen capture needed. It extracts player position, enemy positions, HP, score, and other features to build a 98-dimensional state representation.
+This is a DQN implementation in Rust that plays Kung Fu Master (also known as Spartan X). The agent learns by reading game state directly from the NES RAM - no screen capture needed. It extracts player position, enemy positions, HP, score, and other features to build a 99-dimensional state representation.
 
 The agent outputs 13 actions: noop, movement (left/right/crouch/jump), and punch/kick combinations in different directions.
 
@@ -71,7 +71,7 @@ You can resume training from any checkpoint with `--resume <directory>`.
 
 ## Architecture
 
-The neural network takes 98 input features and outputs Q-values for 13 actions:
+The neural network takes 99 input features and outputs Q-values for 13 actions:
 - Player position, HP, facing direction, stance
 - Enemy positions (up to 4), types, energy levels
 - Knife projectiles

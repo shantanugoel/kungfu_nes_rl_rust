@@ -114,6 +114,7 @@ pub mod ram {
     pub const KNIFE_THROW_SEQ: [u16; 4] = [0x03F0, 0x03F1, 0x03F2, 0x03F3];
 
     pub const KILL_COUNTER: u16 = 0x03B1;
+    pub const SHRUG_COUNTER: u16 = 0x0373;
 
     pub const SCORE_DIGITS: [u16; 6] = [0x0531, 0x0532, 0x0533, 0x0534, 0x0535, 0x0536];
 
@@ -228,6 +229,7 @@ pub struct GameState {
     pub score: u32,
     pub top_score: u32,
     pub kill_count: u8,
+    pub shrug_counter: u8,
     pub enemy_x: [u8; 4],
     pub enemy_y: [u8; 4],
     pub enemy_type: [u8; 4],
@@ -534,6 +536,13 @@ impl GameState {
         f[idx] = boss_hp;
         idx += 1;
         f[idx] = (self.timer.min(9999) as f32) / 9999.0;
+        idx += 1;
+        let shrug = if self.shrug_counter == 0xFF {
+            0
+        } else {
+            self.shrug_counter.min(4)
+        };
+        f[idx] = shrug as f32 / 4.0;
         idx += 1;
 
         debug_assert_eq!(
@@ -894,6 +903,7 @@ impl NesEnv {
                 .map(|digits| self.read_score_digits(digits))
                 .unwrap_or(0),
             kill_count: self.peek(ram::KILL_COUNTER),
+            shrug_counter: self.peek(ram::SHRUG_COUNTER),
             boss_x: self.peek(ram::BOSS_X),
             boss_y: self.peek(ram::BOSS_Y),
             boss_facing: self.peek(ram::BOSS_FACING),
