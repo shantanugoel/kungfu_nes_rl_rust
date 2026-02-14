@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{
-    CachingCons, CachingProd, HeapRb,
     traits::{Consumer, Producer, Split},
+    CachingCons, CachingProd, HeapRb,
 };
 use std::sync::Arc;
 
@@ -33,16 +33,16 @@ impl AudioOutput {
             }
         }
         let supported_range = chosen.context("no supported f32 output config found")?;
-        let desired_rate = cpal::SampleRate(DEFAULT_SAMPLE_RATE);
+        let desired_rate: cpal::SampleRate = DEFAULT_SAMPLE_RATE;
         let min_rate = supported_range.min_sample_rate();
         let max_rate = supported_range.max_sample_rate();
-        let clamped_rate = cpal::SampleRate(desired_rate.0.clamp(min_rate.0, max_rate.0));
+        let clamped_rate: cpal::SampleRate = desired_rate.clamp(min_rate, max_rate);
         let supported_config = supported_range.with_sample_rate(clamped_rate);
         let sample_format = supported_config.sample_format();
         let stream_config: cpal::StreamConfig = supported_config.into();
 
         let channels = stream_config.channels;
-        let sample_rate = stream_config.sample_rate.0;
+        let sample_rate = stream_config.sample_rate;
         let latency_frames =
             ((DEFAULT_LATENCY_MS / 1000.0) * sample_rate as f32 * channels as f32).ceil() as usize;
         let rb_capacity = (latency_frames * 2).max(sample_rate as usize);
