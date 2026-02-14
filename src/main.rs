@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kungfu_rl_rs::Features;
+use kungfu_rl_rs::audio::AudioOutput;
 use kungfu_rl_rs::dqn::{AgentConfig, DqnAgent, Transition, save_checkpoint, save_recent_rewards};
 use kungfu_rl_rs::env::{Action, EnvConfig, NesEnv, RewardConfig, ram};
 use kungfu_rl_rs::eval::run_eval;
@@ -437,8 +438,25 @@ fn play(args: &PlayArgs) -> Result<()> {
         ..Default::default()
     };
     let mut env = NesEnv::new(args.rom.clone(), false, env_config, RewardConfig::default())?;
+    let mut audio = if args.no_audio {
+        env.set_audio_enabled(false);
+        None
+    } else {
+        match AudioOutput::new() {
+            Ok(output) => Some(output),
+            Err(err) => {
+                eprintln!("Audio disabled: {err:?}");
+                env.set_audio_enabled(false);
+                None
+            }
+        }
+    };
     env.set_clock_enabled(!args.no_clock);
-    env.set_real_time(args.real_time);
+    let audio_enabled = audio.is_some();
+    env.set_real_time(args.real_time || audio_enabled);
+    if let Some(output) = audio.as_ref() {
+        env.set_sample_rate(output.sample_rate() as f32);
+    }
     let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
     agent.load(&args.model.to_string_lossy())?;
     agent.epsilon = args.epsilon;
@@ -473,17 +491,21 @@ fn play(args: &PlayArgs) -> Result<()> {
             ..Default::default()
         },
     )?;
-    window.set_target_fps(60);
+    if !audio_enabled {
+        window.set_target_fps(60);
+    }
 
     let mut buf = vec![0u32; 256 * 240];
 
     let mut state = env.reset()?;
+    env.clear_audio_samples();
     let mut need_reset = false;
 
     for ep in 0..args.episodes {
         if need_reset {
             state = env.reset()?;
             need_reset = false;
+            env.clear_audio_samples();
         }
         let mut total_reward = 0.0;
         let mut steps = 0u64;
@@ -508,6 +530,12 @@ fn play(args: &PlayArgs) -> Result<()> {
                 steps += 1;
             }
             state = result.state;
+
+            if let Some(output) = audio.as_mut() {
+                let samples = env.audio_samples();
+                output.push_samples(samples);
+                env.clear_audio_samples();
+            }
 
             let fb = env.frame_buffer();
             blit_rgba_to_u32(fb, &mut buf);
@@ -910,6 +938,8 @@ struct PlayArgs {
     no_clock: bool,
     #[arg(long, default_value_t = false)]
     real_time: bool,
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
 }
 
 #[derive(Parser)]

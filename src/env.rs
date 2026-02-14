@@ -850,6 +850,17 @@ impl NesEnv {
         Ok(())
     }
 
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.deck.set_sample_rate(sample_rate);
+    }
+
+    pub fn set_audio_enabled(&mut self, enabled: bool) {
+        self.deck.bus_mut().apu.skip_mixing = !enabled;
+        if !enabled {
+            self.deck.clear_audio_samples();
+        }
+    }
+
     fn throttle_frame(&mut self) {
         let frame_duration = Duration::from_nanos(1_000_000_000 / 60);
         let now = Instant::now();
@@ -1297,6 +1308,14 @@ impl NesEnv {
 
     pub fn frame_buffer(&mut self) -> &[u8] {
         self.deck.frame_buffer()
+    }
+
+    pub fn audio_samples(&self) -> &[f32] {
+        self.deck.audio_samples()
+    }
+
+    pub fn clear_audio_samples(&mut self) {
+        self.deck.clear_audio_samples();
     }
 }
 

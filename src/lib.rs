@@ -1,6 +1,7 @@
 pub const STATE_DIM: usize = 99;
 pub type Features = [f32; STATE_DIM];
 
+pub mod audio;
 pub mod dqn;
 pub mod env;
 pub mod eval;
