@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "tetanes-core"
 version = "0.12.2"
-source = "git+https://github.com/shantanugoel/tetanes?rev=742e267897b3d0585547d2e59c362e099262d2f1#742e267897b3d0585547d2e59c362e099262d2f1"
+source = "git+https://github.com/lukexor/tetanes/?rev=7f96ba6827edd20ceaf20701df6032bc225cd13c#7f96ba6827edd20ceaf20701df6032bc225cd13c"
 dependencies = [
  "bincode 2.0.1",
  "bitflags 2.10.0",

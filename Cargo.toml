@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tetanes-core = { git = "https://github.com/shantanugoel/tetanes", rev = "742e267897b3d0585547d2e59c362e099262d2f1" }
+tetanes-core = { git = "https://github.com/lukexor/tetanes/", rev = "7f96ba6827edd20ceaf20701df6032bc225cd13c" }
 candle-nn = "0.9"
 minifb = "0.28"                               # lightweight framebuffer for visualization
 rand = "0.9"
