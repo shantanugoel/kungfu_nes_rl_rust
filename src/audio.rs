@@ -14,6 +14,7 @@ pub struct AudioOutput {
     sample_rate: u32,
     channels: u16,
     producer: CachingProd<Arc<HeapRb<f32>>>,
+    gain: f32,
 }
 
 impl AudioOutput {
@@ -70,6 +71,7 @@ impl AudioOutput {
             sample_rate,
             channels,
             producer,
+            gain: 1.0,
         })
     }
 
@@ -81,14 +83,19 @@ impl AudioOutput {
         self.channels
     }
 
+    pub fn set_gain(&mut self, gain: f32) {
+        self.gain = gain;
+    }
+
     pub fn push_samples(&mut self, samples: &[f32]) {
         if samples.is_empty() {
             return;
         }
         let channels = self.channels as usize;
         for &sample in samples {
+            let scaled = (sample * self.gain).clamp(-1.0, 1.0);
             for _ in 0..channels {
-                if self.producer.try_push(sample).is_err() {
+                if self.producer.try_push(scaled).is_err() {
                     break;
                 }
             }

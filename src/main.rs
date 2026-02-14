@@ -454,7 +454,8 @@ fn play(args: &PlayArgs) -> Result<()> {
     env.set_clock_enabled(!args.no_clock);
     let audio_enabled = audio.is_some();
     env.set_real_time(args.real_time || audio_enabled);
-    if let Some(output) = audio.as_ref() {
+    if let Some(output) = audio.as_mut() {
+        output.set_gain(args.volume.max(0.0));
         env.set_sample_rate(output.sample_rate() as f32);
     }
     let mut agent = DqnAgent::new(&device, AgentConfig::default())?;
@@ -938,6 +939,8 @@ struct PlayArgs {
     no_clock: bool,
     #[arg(long, default_value_t = false)]
     real_time: bool,
+    #[arg(long, default_value = "1.0")]
+    volume: f32,
     #[arg(long, default_value_t = false)]
     no_audio: bool,
 }
